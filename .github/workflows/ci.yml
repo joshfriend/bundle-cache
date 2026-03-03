@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Activate Hermit
+        run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y zstd
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: go build ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Activate Hermit
+        run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - name: Lint
+        run: golangci-lint run
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Activate Hermit
+        run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - name: Build all platforms
+        run: just build-all
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/gradle-cache-*
