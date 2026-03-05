@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -250,6 +251,7 @@ func credentialsFromFile() (awsCreds, error) {
 
 	var inSection bool
 	var creds awsCreds
+	var credProcess string
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -274,15 +276,49 @@ func credentialsFromFile() (awsCreds, error) {
 			creds.SecretAccessKey = strings.TrimSpace(v)
 		case "aws_session_token":
 			creds.SessionToken = strings.TrimSpace(v)
+		case "credential_process":
+			credProcess = strings.TrimSpace(v)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return awsCreds{}, err
 	}
-	if creds.AccessKeyID == "" {
-		return awsCreds{}, errors.Errorf("profile %q not found in ~/.aws/credentials", profile)
+	if creds.AccessKeyID != "" {
+		return creds, nil
 	}
-	return creds, nil
+	// Fall back to credential_process if no static credentials were found.
+	if credProcess != "" {
+		return credentialsFromProcess(credProcess)
+	}
+	return awsCreds{}, errors.Errorf("profile %q not found in %s", profile, credsPath)
+}
+
+// credentialsFromProcess executes a credential_process command and parses the
+// JSON output into awsCreds. The output format is the standard AWS SDK
+// credential process protocol (Version 1).
+func credentialsFromProcess(command string) (awsCreds, error) {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return awsCreds{}, errors.New("credential_process is empty")
+	}
+	//nolint:gosec // command comes from the user's own credentials file
+	out, err := exec.Command(parts[0], parts[1:]...).Output()
+	if err != nil {
+		return awsCreds{}, errors.Errorf("credential_process %q: %w", command, err)
+	}
+	var result struct {
+		AccessKeyID     string `json:"AccessKeyId"`
+		SecretAccessKey string `json:"SecretAccessKey"`
+		SessionToken    string `json:"SessionToken"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return awsCreds{}, errors.Errorf("credential_process output: %w", err)
+	}
+	return awsCreds{
+		AccessKeyID:     result.AccessKeyID,
+		SecretAccessKey: result.SecretAccessKey,
+		SessionToken:    result.SessionToken,
+	}, nil
 }
 
 // credentialsFromIMDS fetches temporary credentials from the EC2 Instance
