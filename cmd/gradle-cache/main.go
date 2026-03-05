@@ -12,16 +12,21 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/kong"
@@ -30,8 +35,9 @@ import (
 )
 
 type CLI struct {
-	Restore RestoreCmd `cmd:"" help:"Find the newest cached bundle in history and restore it to GRADLE_USER_HOME."`
-	Save    SaveCmd    `cmd:"" help:"Bundle GRADLE_USER_HOME/caches and upload to S3 tagged with a commit SHA."`
+	LogLevel string     `help:"Log level." default:"info" enum:"debug,info,warn,error"`
+	Restore  RestoreCmd `cmd:"" help:"Find the newest cached bundle in history and restore it to GRADLE_USER_HOME."`
+	Save     SaveCmd    `cmd:"" help:"Bundle GRADLE_USER_HOME/caches and upload to S3 tagged with a commit SHA."`
 }
 
 type s3Flags struct {
@@ -68,6 +74,8 @@ func (c *RestoreCmd) AfterApply() error {
 }
 
 func (c *RestoreCmd) Run(ctx context.Context) error {
+	totalStart := time.Now()
+
 	client, err := newMinioClient(c.Region)
 	if err != nil {
 		return err
@@ -75,7 +83,9 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 
 	bundleFile := bundleFilename(c.CacheKey)
 
-	// Determine which commits to check.
+	// ── Find phase ────────────────────────────────────────────────────────────
+	findStart := time.Now()
+
 	var commits []string
 	if c.Commit != "" {
 		commits = []string{c.Commit}
@@ -86,30 +96,33 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		}
 	}
 
-	// Find the first S3 hit.
 	var hitKey string
 	for _, sha := range commits {
 		key := s3Key(sha, c.CacheKey, bundleFile)
 		_, statErr := client.StatObject(ctx, c.Bucket, key, minio.StatObjectOptions{})
 		if statErr == nil {
 			hitKey = key
-			fmt.Fprintf(os.Stderr, "Cache hit: %s\n", key) //nolint:forbidigo
 			break
 		}
+		slog.Debug("cache miss", "sha", sha[:min(8, len(sha))])
 	}
+	slog.Debug("find complete", "duration", time.Since(findStart), "commits_checked", len(commits))
 
 	if hitKey == "" {
-		fmt.Fprintln(os.Stderr, "No cache bundle found in history.") //nolint:forbidigo
+		slog.Info("no cache bundle found in history")
 		return nil
 	}
+	slog.Info("cache hit", "key", hitKey)
 
-	// Download and extract into a temp directory.
+	// ── Download + extract phase ───────────────────────────────────────────────
+	dlStart := time.Now()
+	slog.Info("downloading bundle", "key", hitKey)
+
 	tmpDir, err := os.MkdirTemp("", "gradle-cache-*")
 	if err != nil {
 		return errors.Wrap(err, "create temp dir")
 	}
 
-	fmt.Fprintf(os.Stderr, "Downloading %s...\n", hitKey) //nolint:forbidigo
 	obj, err := client.GetObject(ctx, c.Bucket, hitKey, minio.GetObjectOptions{})
 	if err != nil {
 		return errors.Wrap(err, "get object")
@@ -119,6 +132,7 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	if err := extractTarZstd(ctx, obj, tmpDir); err != nil {
 		return errors.Wrap(err, "extract bundle")
 	}
+	slog.Debug("download+extract complete", "duration", time.Since(dlStart))
 
 	// Symlink $GRADLE_USER_HOME/caches → tmpDir/caches.
 	cachesTarget := filepath.Join(tmpDir, "caches")
@@ -132,7 +146,7 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	if err := os.Symlink(cachesTarget, localCaches); err != nil {
 		return errors.Wrap(err, "symlink caches dir")
 	}
-	fmt.Fprintf(os.Stderr, "Restored: %s -> %s\n", localCaches, cachesTarget) //nolint:forbidigo
+	slog.Info("restored", "link", localCaches, "target", cachesTarget)
 
 	// Restore configuration-cache and convention build dirs from the current directory.
 	projectDir, err := os.Getwd()
@@ -143,6 +157,7 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		return err
 	}
 
+	slog.Debug("restore complete", "total_duration", time.Since(totalStart))
 	return nil
 }
 
@@ -164,7 +179,7 @@ func restoreProjectDirs(tmpDir, projectDir string, includedBuilds []string) erro
 		if err := os.Symlink(srcCC, dstCC); err != nil {
 			return errors.Wrap(err, "symlink configuration-cache")
 		}
-		fmt.Fprintf(os.Stderr, "Restored: %s -> %s\n", dstCC, srcCC) //nolint:forbidigo
+		slog.Info("restored", "link", dstCC, "target", srcCC)
 	}
 
 	// Included build output dirs present in the extracted bundle.
@@ -180,7 +195,7 @@ func restoreProjectDirs(tmpDir, projectDir string, includedBuilds []string) erro
 		if err := os.Symlink(src, dst); err != nil {
 			return errors.Errorf("symlink %s: %w", rel, err)
 		}
-		fmt.Fprintf(os.Stderr, "Restored: %s -> %s\n", dst, src) //nolint:forbidigo
+		slog.Info("restored", "link", dst, "target", src)
 	}
 
 	return nil
@@ -234,7 +249,7 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 
 	// Skip upload if bundle already exists.
 	if _, err := client.StatObject(ctx, c.Bucket, key, minio.StatObjectOptions{}); err == nil {
-		fmt.Fprintf(os.Stderr, "Bundle already exists: %s\n", key) //nolint:forbidigo
+		slog.Info("bundle already exists", "key", key)
 		return nil
 	}
 
@@ -247,7 +262,8 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 	sources := []tarSource{{BaseDir: c.GradleUserHome, Path: "./caches"}}
 	sources = append(sources, projectDirSources(projectDir, c.IncludedBuilds)...)
 
-	fmt.Fprintf(os.Stderr, "Saving bundle to %s...\n", key) //nolint:forbidigo
+	slog.Info("saving bundle", "key", key)
+	saveStart := time.Now()
 
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
@@ -268,7 +284,8 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 		return errors.Wrap(err, "create bundle archive")
 	}
 
-	fmt.Fprintf(os.Stderr, "Saved: %s\n", key) //nolint:forbidigo
+	slog.Debug("archive+upload complete", "duration", time.Since(saveStart))
+	slog.Info("saved bundle", "key", key)
 	return nil
 }
 
@@ -296,9 +313,36 @@ func projectDirSources(projectDir string, includedBuilds []string) []tarSource {
 func main() {
 	cli := &CLI{}
 	kctx := kong.Parse(cli, kong.UsageOnError(), kong.HelpOptions{Compact: true})
+	setupLogger(cli.LogLevel)
 	ctx := context.Background()
 	kctx.BindTo(ctx, (*context.Context)(nil))
 	kctx.FatalIfErrorf(kctx.Run(ctx))
+}
+
+// setupLogger configures the global slog logger at the requested level.
+// Timestamps are omitted — CI systems capture their own.
+func setupLogger(level string) {
+	var l slog.Level
+	switch level {
+	case "debug":
+		l = slog.LevelDebug
+	case "warn":
+		l = slog.LevelWarn
+	case "error":
+		l = slog.LevelError
+	default: // "info"
+		l = slog.LevelInfo
+	}
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: l,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{} // omit timestamp
+			}
+			return a
+		},
+	})
+	slog.SetDefault(slog.New(handler))
 }
 
 // bundleFilename converts a cache key to its S3 filename, matching the Ruby bundled-cache-manager.
@@ -405,39 +449,134 @@ func gitHead(ctx context.Context, gitDir string) (string, error) {
 }
 
 // extractTarZstd decompresses a zstd-compressed tar stream from r into dir.
+// Decompression runs in the zstd subprocess (-T0 uses all cores); file writes
+// are dispatched to a worker pool so NVMe IOPS can be fully exploited.
 func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
 	zstdCmd := exec.CommandContext(ctx, "zstd", "-dc", "-T0")
-	tarCmd := exec.CommandContext(ctx, "tar", "-xpf", "-", "-C", dir) //nolint:gosec
-
 	zstdCmd.Stdin = r
-	zstdStdout, err := zstdCmd.StdoutPipe()
+
+	zstdOut, err := zstdCmd.StdoutPipe()
 	if err != nil {
 		return errors.Wrap(err, "zstd stdout pipe")
 	}
 
-	var zstdStderr, tarStderr bytes.Buffer
+	var zstdStderr bytes.Buffer
 	zstdCmd.Stderr = &zstdStderr
-	tarCmd.Stdin = zstdStdout
-	tarCmd.Stderr = &tarStderr
 
 	if err := zstdCmd.Start(); err != nil {
 		return errors.Wrap(err, "start zstd")
 	}
-	if err := tarCmd.Start(); err != nil {
-		return errors.Join(errors.Wrap(err, "start tar"), zstdCmd.Wait())
-	}
 
+	extractErr := extractTar(zstdOut, dir)
 	zstdErr := zstdCmd.Wait()
-	tarErr := tarCmd.Wait()
 
 	var errs []error
+	if extractErr != nil {
+		errs = append(errs, extractErr)
+	}
 	if zstdErr != nil {
 		errs = append(errs, errors.Errorf("zstd: %w: %s", zstdErr, zstdStderr.String()))
 	}
-	if tarErr != nil {
-		errs = append(errs, errors.Errorf("tar: %w: %s", tarErr, tarStderr.String()))
-	}
 	return errors.Join(errs...)
+}
+
+// extractTar reads a tar stream from r and extracts it into dir.
+// Directories and symlinks are created on the calling goroutine; regular file
+// writes are dispatched to a worker pool (one worker per logical CPU) so that
+// many small files can be flushed to disk concurrently.
+func extractTar(r io.Reader, dir string) error {
+	type fileJob struct {
+		path string
+		mode os.FileMode
+		data []byte
+	}
+
+	// File writes are I/O bound, so we use more workers than CPU cores to keep
+	// the NVMe queue full. 2×CPU gives a reasonable baseline; 16 is a floor for
+	// machines with few cores where 2×CPU would still underutilize IOPS.
+	numWorkers := max(16, 2*runtime.NumCPU())
+	jobs := make(chan fileJob, numWorkers*2)
+
+	var (
+		workerErrs []error
+		mu         sync.Mutex
+	)
+
+	var wg sync.WaitGroup
+	for range numWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if err := os.MkdirAll(filepath.Dir(job.path), 0o755); err != nil {
+					mu.Lock()
+					workerErrs = append(workerErrs, errors.Errorf("create parent of %s: %w", job.path, err))
+					mu.Unlock()
+					continue
+				}
+				if err := os.WriteFile(job.path, job.data, job.mode); err != nil {
+					mu.Lock()
+					workerErrs = append(workerErrs, errors.Errorf("write %s: %w", job.path, err))
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	tr := tar.NewReader(r)
+	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
+	var readErr error
+readLoop:
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			readErr = errors.Wrap(err, "read tar entry")
+			break
+		}
+
+		target := filepath.Join(dir, hdr.Name)
+		if !strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), cleanDir) {
+			readErr = errors.Errorf("tar entry %q escapes destination directory", hdr.Name)
+			break
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, hdr.FileInfo().Mode()); err != nil {
+				readErr = errors.Errorf("mkdir %s: %w", hdr.Name, err)
+				break readLoop
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				readErr = errors.Errorf("read %s: %w", hdr.Name, err)
+				break readLoop
+			}
+			jobs <- fileJob{path: target, mode: hdr.FileInfo().Mode(), data: data}
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				readErr = errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
+				break readLoop
+			}
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				readErr = errors.Errorf("symlink %s → %s: %w", hdr.Name, hdr.Linkname, err)
+				break readLoop
+			}
+		}
+	}
+
+	close(jobs)
+	wg.Wait()
+
+	var allErrs []error
+	if readErr != nil {
+		allErrs = append(allErrs, readErr)
+	}
+	allErrs = append(allErrs, workerErrs...)
+	return errors.Join(allErrs...)
 }
 
 // createTarZstd creates a zstd-compressed tar archive from the given sources and

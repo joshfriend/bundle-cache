@@ -2,6 +2,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
@@ -491,6 +492,120 @@ func TestHistoryCommits(t *testing.T) {
 		_, err := historyCommits(ctx, repo, "refs/heads/nonexistent", 5)
 		if err == nil {
 			t.Error("expected error for invalid ref, got nil")
+		}
+	})
+}
+
+// ─── extractTar parallel extraction tests ────────────────────────────────────
+
+func TestExtractTar(t *testing.T) {
+	t.Run("regular file and directory are extracted", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "subdir/", Mode: 0o755}))
+		data := []byte("hello world")
+		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "subdir/hello.txt", Mode: 0o644, Size: int64(len(data))}))
+		_, err := tw.Write(data)
+		must(t, err)
+		must(t, tw.Close())
+
+		dir := t.TempDir()
+		must(t, extractTar(&buf, dir))
+
+		got, err := os.ReadFile(filepath.Join(dir, "subdir", "hello.txt"))
+		if err != nil {
+			t.Fatalf("read extracted file: %v", err)
+		}
+		if string(got) != "hello world" {
+			t.Errorf("content = %q, want %q", string(got), "hello world")
+		}
+	})
+
+	t.Run("symlink is created", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		data := []byte("target content")
+		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "real.txt", Mode: 0o644, Size: int64(len(data))}))
+		_, err := tw.Write(data)
+		must(t, err)
+		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: "link.txt", Linkname: "real.txt"}))
+		must(t, tw.Close())
+
+		dir := t.TempDir()
+		must(t, extractTar(&buf, dir))
+
+		target, err := os.Readlink(filepath.Join(dir, "link.txt"))
+		if err != nil {
+			t.Fatalf("readlink: %v", err)
+		}
+		if target != "real.txt" {
+			t.Errorf("symlink target = %q, want %q", target, "real.txt")
+		}
+	})
+
+	t.Run("multiple files extracted in parallel", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for i := range 20 {
+			name := fmt.Sprintf("file%02d.txt", i)
+			data := []byte(fmt.Sprintf("content %d", i))
+			must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: 0o644, Size: int64(len(data))}))
+			_, err := tw.Write(data)
+			must(t, err)
+		}
+		must(t, tw.Close())
+
+		dir := t.TempDir()
+		must(t, extractTar(&buf, dir))
+
+		for i := range 20 {
+			name := fmt.Sprintf("file%02d.txt", i)
+			got, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Errorf("read %s: %v", name, err)
+				continue
+			}
+			want := fmt.Sprintf("content %d", i)
+			if string(got) != want {
+				t.Errorf("%s: content = %q, want %q", name, string(got), want)
+			}
+		}
+	})
+
+	t.Run("path traversal is rejected", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		data := []byte("evil")
+		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "../escape.txt", Mode: 0o644, Size: int64(len(data))}))
+		_, err := tw.Write(data)
+		must(t, err)
+		must(t, tw.Close())
+
+		dir := t.TempDir()
+		if err := extractTar(&buf, dir); err == nil {
+			t.Error("expected error for path traversal entry, got nil")
+		}
+	})
+
+	t.Run("parent directories are created implicitly", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		// No explicit directory entry — parent must be created by the worker.
+		data := []byte("nested")
+		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "a/b/c/file.txt", Mode: 0o644, Size: int64(len(data))}))
+		_, err := tw.Write(data)
+		must(t, err)
+		must(t, tw.Close())
+
+		dir := t.TempDir()
+		must(t, extractTar(&buf, dir))
+
+		got, err := os.ReadFile(filepath.Join(dir, "a", "b", "c", "file.txt"))
+		if err != nil {
+			t.Fatalf("read nested file: %v", err)
+		}
+		if string(got) != "nested" {
+			t.Errorf("content = %q, want %q", string(got), "nested")
 		}
 	})
 }
