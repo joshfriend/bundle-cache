@@ -111,7 +111,9 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	}
 	slog.Info("cache hit", "key", hitKey)
 
-	// ── Download + extract phase ───────────────────────────────────────────────
+	// ── Download phase ────────────────────────────────────────────────────────
+	// Download to a temp file first so we get a clean download-speed measurement
+	// independent of decompression and file-extraction throughput.
 	dlStart := time.Now()
 	slog.Info("downloading bundle", "key", hitKey)
 
@@ -126,22 +128,40 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	}
 	defer obj.Close() //nolint:errcheck
 
-	// Wrap with a counting reader so we can log download speed.
-	cr := &countingReader{r: obj}
-	if err := extractTarZstd(ctx, cr, tmpDir); err != nil {
+	bundle, err := os.CreateTemp("", "gradle-cache-bundle-*")
+	if err != nil {
+		return errors.Wrap(err, "create bundle temp file")
+	}
+	defer func() {
+		bundle.Close()           //nolint:errcheck,gosec
+		os.Remove(bundle.Name()) //nolint:errcheck,gosec
+	}()
+
+	dlBytes, err := io.Copy(bundle, obj)
+	if err != nil {
+		return errors.Wrap(err, "download bundle")
+	}
+	dlElapsed := time.Since(dlStart)
+	dlMBps := float64(dlBytes) / dlElapsed.Seconds() / 1e6
+	sizeMB := float64(dlBytes) / 1e6
+	if contentLen > 0 {
+		sizeMB = float64(contentLen) / 1e6
+	}
+	slog.Info("download complete", "duration", dlElapsed,
+		"size_mb", fmt.Sprintf("%.1f", sizeMB),
+		"speed_mbps", fmt.Sprintf("%.1f", dlMBps))
+
+	// ── Extract phase ─────────────────────────────────────────────────────────
+	if _, err := bundle.Seek(0, io.SeekStart); err != nil {
+		return errors.Wrap(err, "rewind bundle")
+	}
+	extractStart := time.Now()
+	if err := extractTarZstd(ctx, bundle, tmpDir); err != nil {
 		return errors.Wrap(err, "extract bundle")
 	}
-	elapsed := time.Since(dlStart)
-	mbps := float64(cr.n) / elapsed.Seconds() / 1e6
-	if contentLen > 0 {
-		slog.Info("download+extract complete", "duration", elapsed,
-			"size_mb", fmt.Sprintf("%.1f", float64(contentLen)/1e6),
-			"speed_mbps", fmt.Sprintf("%.1f", mbps))
-	} else {
-		slog.Info("download+extract complete", "duration", elapsed,
-			"size_mb", fmt.Sprintf("%.1f", float64(cr.n)/1e6),
-			"speed_mbps", fmt.Sprintf("%.1f", mbps))
-	}
+	extractElapsed := time.Since(extractStart)
+	slog.Info("extract complete", "duration", extractElapsed,
+		"speed_mbps", fmt.Sprintf("%.1f", float64(dlBytes)/extractElapsed.Seconds()/1e6))
 
 	// Symlink $GRADLE_USER_HOME/caches → tmpDir/caches.
 	cachesTarget := filepath.Join(tmpDir, "caches")
@@ -425,18 +445,6 @@ func gitHead(ctx context.Context, gitDir string) (string, error) {
 		return "", errors.Errorf("git rev-parse HEAD: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-// countingReader wraps an io.Reader and counts bytes read.
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
 }
 
 // zstdDecompressArgs returns the command + args for zstd decompression.
