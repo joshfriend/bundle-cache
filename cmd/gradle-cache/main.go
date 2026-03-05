@@ -265,8 +265,8 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 		return errors.Wrap(err, "create temp file")
 	}
 	defer func() {
-		tmp.Close()           //nolint:errcheck
-		os.Remove(tmp.Name()) //nolint:errcheck
+		tmp.Close()           //nolint:errcheck,gosec
+		os.Remove(tmp.Name()) //nolint:errcheck,gosec
 	}()
 
 	slog.Info("saving bundle", "key", key)
@@ -472,7 +472,7 @@ func extractTarN(r io.Reader, dir string, numWorkers int) error {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				if err := os.MkdirAll(filepath.Dir(job.path), 0o755); err != nil {
+				if err := os.MkdirAll(filepath.Dir(job.path), 0o750); err != nil {
 					mu.Lock()
 					workerErrs = append(workerErrs, errors.Errorf("create parent of %s: %w", job.path, err))
 					mu.Unlock()
@@ -513,7 +513,7 @@ readLoop:
 				readErr = errors.Errorf("mkdir %s: %w", hdr.Name, err)
 				break readLoop
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			data, err := io.ReadAll(tr)
 			if err != nil {
 				readErr = errors.Errorf("read %s: %w", hdr.Name, err)
@@ -521,7 +521,7 @@ readLoop:
 			}
 			jobs <- fileJob{path: target, mode: hdr.FileInfo().Mode(), data: data}
 		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
 				readErr = errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
 				break readLoop
 			}

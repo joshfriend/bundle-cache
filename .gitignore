@@ -1,2 +1,3 @@
 dist/
 /gradle-cache
+.idea/

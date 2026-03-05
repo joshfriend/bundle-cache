@@ -8,6 +8,15 @@ linters:
     - ineffassign
     - unused
     - gosec
+  settings:
+    gosec:
+      excludes:
+        - G104  # unhandled errors in defer/cleanup — already caught by errcheck
+        - G117  # exported field name matches secret pattern — struct fields, not hardcoded creds
+        - G304  # file path via variable — paths come from trusted env vars or ~/.aws
+        - G305  # path traversal in tar extraction — validated immediately after filepath.Join
+        - G703  # path traversal taint — credentials path comes from env var or ~/.aws
+        - G704  # SSRF taint analysis — S3 endpoint is user-configured; IMDS URL is a fixed constant
 
 formatters:
   enable:
