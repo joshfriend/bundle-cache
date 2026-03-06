@@ -1,4 +1,4 @@
-//go:build !darwin && !linux
+//go:build !darwin
 
 package main
 
@@ -12,16 +12,30 @@ import (
 	"github.com/alecthomas/errors"
 )
 
-// extractTarPlatform falls back to sequential streaming extraction on unknown platforms.
+// extractTarPlatform uses sequential extraction on non-darwin platforms. The
+// Linux VFS writeback path coalesces dirty pages most efficiently when a single
+// writer produces sequential writes, matching the behaviour of GNU tar. Parallel
+// writes from multiple goroutines fragment the writeback queue and are
+// consistently slower on Linux ext4/xfs despite identical throughput on APFS.
 func extractTarPlatform(r io.Reader, dir string) error {
 	return extractTarSeq(r, dir)
 }
 
+// extractTarSeq extracts a tar stream sequentially using a fixed-size copy
+// buffer. Files are streamed directly from the tar reader to disk one 1 MiB
+// block at a time — the same block-streaming pattern GNU tar uses — so the
+// decompressor pipe keeps flowing without large per-file allocations.
 func extractTarSeq(r io.Reader, dir string) error {
+	// Single fixed-size copy buffer for all file writes in this call.
+	// 1 MiB is large enough to amortise write syscall overhead without
+	// creating memory pressure for many-file archives.
 	copyBuf := make([]byte, 1<<20)
+
 	tr := tar.NewReader(r)
 	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
 
+	// createdDirs tracks parent directories we have already MkdirAll'd so
+	// each unique path is only created once (same optimisation as darwin).
 	createdDirs := make(map[string]struct{})
 	ensureDir := func(d string) error {
 		if _, ok := createdDirs[d]; ok {
@@ -53,6 +67,7 @@ func extractTarSeq(r io.Reader, dir string) error {
 			if err := ensureDir(target); err != nil {
 				return errors.Errorf("mkdir %s: %w", hdr.Name, err)
 			}
+
 		case tar.TypeReg:
 			if err := ensureDir(filepath.Dir(target)); err != nil {
 				return errors.Errorf("mkdir %s: %w", hdr.Name, err)
@@ -68,6 +83,7 @@ func extractTarSeq(r io.Reader, dir string) error {
 			if err := f.Close(); err != nil {
 				return errors.Errorf("close %s: %w", hdr.Name, err)
 			}
+
 		case tar.TypeSymlink:
 			if err := ensureDir(filepath.Dir(target)); err != nil {
 				return errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)

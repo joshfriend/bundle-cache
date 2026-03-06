@@ -2,10 +2,10 @@
 
 A CLI tool for saving and restoring Gradle build cache bundles from S3.
 
-Bundles are stored in S3 keyed by commit SHA, so `restore` doesn't need to know
+Bundles are stored keyed by commit SHA, so `restore` doesn't need to know
 exactly which commit produced a given bundle. Instead, it walks the local git
 history from a given ref (default: `HEAD`) and tries each commit SHA in order,
-newest first, until it finds a bundle that exists in S3. This means a developer
+newest first, until it finds a bundle that exists. This means a developer
 on a feature branch will automatically get the bundle from the most recent
 main-branch commit that has one, without needing to know its SHA in advance.
 
@@ -23,6 +23,8 @@ This installs the latest release to `~/.local/bin`. Set `INSTALL_DIR` to overrid
 
 ## Usage
 
+### Base cache (main branch)
+
 ```
 gradle-cache restore --bucket <bucket> --cache-key <key> [--ref main]
 gradle-cache save    --bucket <bucket> --cache-key <key>
@@ -37,8 +39,27 @@ are archived alongside `$GRADLE_USER_HOME/caches`. Accepts a direct path
 (`buildSrc`, `build-logic`) or a glob (`plugins/*`) to include all
 subdirectories. Defaults to `buildSrc`.
 
-Credentials are resolved via the standard AWS credential chain (environment
-variables, IRSA, instance profiles, etc.).
+### Branch delta cache (PR branches)
+
+For PR builds, pass `--branch` to `restore` to apply a branch delta in the same invocation. The delta bundle is downloaded concurrently with the base extraction so it adds no extra latency:
+
+```sh
+# Restore phase (single invocation)
+gradle-cache restore     --bucket <bucket> --cache-key <key> --ref main --branch $BRANCH_NAME
+
+# ... run the Gradle build ...
+
+# Save phase
+gradle-cache save-delta  --bucket <bucket> --cache-key <key> --branch $BRANCH_NAME
+```
+
+After the build, `save-delta` scans for files created since the restore marker and uploads a cumulative delta bundle keyed by branch name — so it survives rebases and force-pushes without any extra bookkeeping.
+
+If you need to apply a delta separately (e.g. the base was already restored by another step), `restore-delta` is still available as a standalone subcommand.
+
+### Credentials
+
+S3 credentials are resolved via the standard AWS credential chain (environment variables, IRSA, instance profiles, etc.).
 
 ## License
 

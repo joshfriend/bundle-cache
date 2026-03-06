@@ -604,6 +604,243 @@ func TestTarZstdSymlinkDereference(t *testing.T) {
 	}
 }
 
+// ─── branchSlug tests ────────────────────────────────────────────────────────
+
+func TestBranchSlug(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"main", "main"},
+		{"feature/my-pr", "feature--my-pr"},
+		{"fix/JIRA-123", "fix--JIRA-123"},
+		{"refs/heads/main", "refs--heads--main"},
+		{"branch with spaces", "branch-with-spaces"},
+		{"a#b?c&d", "a-b-c-d"},
+		{"feature/foo/bar", "feature--foo--bar"},
+	}
+	for _, tt := range tests {
+		if got := branchSlug(tt.input); got != tt.want {
+			t.Errorf("branchSlug(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDeltaCommit(t *testing.T) {
+	tests := []struct {
+		branch, want string
+	}{
+		{"main", "branches/main"},
+		{"feature/my-pr", "branches/feature--my-pr"},
+	}
+	for _, tt := range tests {
+		if got := deltaCommit(tt.branch); got != tt.want {
+			t.Errorf("deltaCommit(%q) = %q, want %q", tt.branch, got, tt.want)
+		}
+	}
+}
+
+// ─── Delta archive round-trip test ───────────────────────────────────────────
+
+// TestDeltaTarZstdRoundTrip verifies that createDeltaTarZstd/writeDeltaTar pack
+// only the files listed and that they can be extracted back via extractTarZstd.
+// It also exercises the mtime-based file selection used by SaveDeltaCmd: a
+// "base" file is written before the marker and a "new" file after, and only the
+// new file should appear in the delta.
+func TestDeltaTarZstdRoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd not available")
+	}
+
+	ctx := context.Background()
+
+	// Set up a fake GradleUserHome with a caches/ directory.
+	gradleHome := t.TempDir()
+	cachesDir := filepath.Join(gradleHome, "caches")
+	must(t, os.MkdirAll(filepath.Join(cachesDir, "modules-2"), 0o755))
+
+	// Write a "base" file that predates the marker.
+	baseFile := filepath.Join(cachesDir, "modules-2", "base.jar")
+	must(t, os.WriteFile(baseFile, []byte("base content"), 0o644))
+
+	// Touch the marker.
+	markerPath := filepath.Join(gradleHome, ".cache-restore-marker")
+	must(t, touchMarkerFile(markerPath))
+
+	// Write a "new" file after the marker — this is what the build created.
+	newFile := filepath.Join(cachesDir, "modules-2", "new.jar")
+	must(t, os.WriteFile(newFile, []byte("new content"), 0o644))
+
+	// Determine which files are newer than the marker (simulating SaveDeltaCmd's scan).
+	markerInfo, err := os.Stat(markerPath)
+	must(t, err)
+	since := markerInfo.ModTime()
+
+	var newFiles []string
+	must(t, filepath.Walk(cachesDir, func(path string, fi os.FileInfo, err error) error {
+		if err != nil || !fi.Mode().IsRegular() {
+			return err
+		}
+		if fi.ModTime().After(since) {
+			rel, _ := filepath.Rel(cachesDir, path)
+			newFiles = append(newFiles, filepath.Join("caches", rel))
+		}
+		return nil
+	}))
+
+	if len(newFiles) == 0 {
+		t.Skip("mtime resolution too coarse to distinguish marker from new file; skipping")
+	}
+
+	// Pack the delta.
+	var buf bytes.Buffer
+	must(t, createDeltaTarZstd(ctx, &buf, gradleHome, newFiles))
+
+	// Extract into a fresh directory and verify only the new file is present.
+	dstDir := t.TempDir()
+	must(t, extractTarZstd(ctx, &buf, dstDir))
+
+	newPath := filepath.Join(dstDir, "caches", "modules-2", "new.jar")
+	if _, err := os.Stat(newPath); err != nil {
+		t.Errorf("expected new.jar in delta: %v", err)
+	}
+	basePath := filepath.Join(dstDir, "caches", "modules-2", "base.jar")
+	if _, err := os.Stat(basePath); err == nil {
+		t.Error("base.jar should not be in delta — it predates the marker")
+	}
+
+	data, err := os.ReadFile(newPath)
+	must(t, err)
+	if string(data) != "new content" {
+		t.Errorf("new.jar content = %q, want %q", string(data), "new content")
+	}
+}
+
+// ─── Delta scan benchmark ─────────────────────────────────────────────────────
+
+// BenchmarkDeltaScan measures the mtime-walk hot path used by SaveDeltaCmd:
+// EvalSymlinks + filepath.Walk + fi.ModTime().After(marker). The directory
+// structure mirrors a real Gradle cache (nested group/artifact/version dirs).
+//
+// Run with:
+//
+//	go test -bench=BenchmarkDeltaScan -benchtime=5s ./cmd/gradle-cache/
+//
+// Output includes a "files/op" metric so ns/file is straightforward to derive.
+func BenchmarkDeltaScan(b *testing.B) {
+	for _, nFiles := range []int{5_000, 20_000, 50_000} {
+		nFiles := nFiles
+		b.Run(fmt.Sprintf("files=%d", nFiles), func(b *testing.B) {
+			// Build a simulated Gradle cache:
+			//   root/caches/group-N/artifact-N/vX.Y/file-N.jar
+			// 50 groups × 20 artifacts gives ~1000 leaf dirs for 50k files.
+			root := b.TempDir()
+			caches := filepath.Join(root, "caches")
+			for i := range nFiles {
+				dir := filepath.Join(caches,
+					fmt.Sprintf("group%d", i%50),
+					fmt.Sprintf("artifact%d", i%20),
+				)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					b.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d.jar", i)), []byte("x"), 0o644); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			// Write marker after all "base" files — mirrors what restore does.
+			markerPath := filepath.Join(root, ".cache-restore-marker")
+			if err := touchMarkerFile(markerPath); err != nil {
+				b.Fatal(err)
+			}
+			markerInfo, err := os.Stat(markerPath)
+			if err != nil {
+				b.Fatal(err)
+			}
+			since := markerInfo.ModTime()
+
+			// Resolve the caches dir, just as SaveDeltaCmd does (it may be a symlink).
+			realCaches, err := filepath.EvalSymlinks(caches)
+			if err != nil {
+				realCaches = caches
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for range b.N {
+				var found int
+				if walkErr := filepath.Walk(realCaches, func(path string, fi os.FileInfo, err error) error {
+					if err != nil || !fi.Mode().IsRegular() {
+						return err
+					}
+					if fi.ModTime().After(since) {
+						found++
+					}
+					return nil
+				}); walkErr != nil {
+					b.Fatal(walkErr)
+				}
+				_ = found
+			}
+			b.ReportMetric(float64(nFiles), "files/op")
+		})
+	}
+}
+
+// BenchmarkDeltaScanReal exercises the production collectNewFiles path against a real
+// extracted cache. Point GRADLE_CACHE_BENCH_DIR at the caches/ directory from a prior
+// restore (the symlink or its real target) and run:
+//
+//	GRADLE_CACHE_BENCH_DIR=~/.gradle/caches \
+//	  go test -bench=BenchmarkDeltaScanReal -benchtime=3x ./cmd/gradle-cache/
+func BenchmarkDeltaScanReal(b *testing.B) {
+	cachesDir := os.Getenv("GRADLE_CACHE_BENCH_DIR")
+	if cachesDir == "" {
+		b.Skip("set GRADLE_CACHE_BENCH_DIR to a Gradle caches/ directory to run this benchmark")
+	}
+
+	realCaches, err := filepath.EvalSymlinks(cachesDir)
+	if err != nil {
+		b.Fatalf("EvalSymlinks(%s): %v", cachesDir, err)
+	}
+	gradleHome := filepath.Dir(realCaches) // parent of caches/ is the Gradle user home
+
+	// Count total files once, outside the timed loop.
+	var totalFiles int
+	if err := filepath.Walk(realCaches, func(_ string, fi os.FileInfo, err error) error {
+		if err == nil && fi.Mode().IsRegular() {
+			totalFiles++
+		}
+		return nil
+	}); err != nil {
+		b.Fatalf("pre-count walk: %v", err)
+	}
+	b.Logf("cache: %d regular files at %s", totalFiles, realCaches)
+
+	// Write the marker after all cache files so they all predate it — simulating
+	// the "clean restore, no build has run yet" baseline.
+	markerPath := filepath.Join(b.TempDir(), ".bench-marker")
+	if err := touchMarkerFile(markerPath); err != nil {
+		b.Fatal(err)
+	}
+	markerInfo, err := os.Stat(markerPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	since := markerInfo.ModTime()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		files, err := collectNewFiles(realCaches, since, gradleHome)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = files
+	}
+	b.ReportMetric(float64(totalFiles), "files/op")
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func must(t *testing.T, err error) {
