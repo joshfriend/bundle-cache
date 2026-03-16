@@ -274,6 +274,9 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		return errors.Errorf("extracted bundle does not contain a caches/ directory: %w", err)
 	}
 	localCaches := filepath.Join(c.GradleUserHome, "caches")
+	if err := os.MkdirAll(c.GradleUserHome, 0o750); err != nil {
+		return errors.Wrap(err, "create gradle user home dir")
+	}
 	if err := os.RemoveAll(localCaches); err != nil {
 		return errors.Wrap(err, "remove existing caches dir")
 	}
