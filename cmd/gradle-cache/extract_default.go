@@ -18,7 +18,16 @@ import (
 // writes from multiple goroutines fragment the writeback queue and are
 // consistently slower on Linux ext4/xfs despite identical throughput on APFS.
 func extractTarPlatform(r io.Reader, dir string) error {
-	return extractTarSeq(r, dir)
+	return extractTarSeqRouted(r, func(name string) string {
+		return filepath.Join(dir, name)
+	}, false)
+}
+
+// extractTarPlatformRouted is the routing-aware variant of extractTarPlatform.
+// targetFn maps a cleaned tar entry name to its absolute destination path.
+// If skipExisting is true, files that already exist on disk are left untouched.
+func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
+	return extractTarSeqRouted(r, targetFn, skipExisting)
 }
 
 // extractTarSeq extracts a tar stream sequentially using a fixed-size copy
@@ -26,13 +35,21 @@ func extractTarPlatform(r io.Reader, dir string) error {
 // block at a time — the same block-streaming pattern GNU tar uses — so the
 // decompressor pipe keeps flowing without large per-file allocations.
 func extractTarSeq(r io.Reader, dir string) error {
+	return extractTarSeqRouted(r, func(name string) string {
+		return filepath.Join(dir, name)
+	}, false)
+}
+
+// extractTarSeqRouted is the core sequential extractor. targetFn maps a
+// cleaned tar entry name (e.g. "caches/8.14.3/foo") to its absolute
+// destination path. skipExisting skips writing files that already exist.
+func extractTarSeqRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
 	// Single fixed-size copy buffer for all file writes in this call.
 	// 1 MiB is large enough to amortise write syscall overhead without
 	// creating memory pressure for many-file archives.
 	copyBuf := make([]byte, 1<<20)
 
 	tr := tar.NewReader(r)
-	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
 
 	// createdDirs tracks parent directories we have already MkdirAll'd so
 	// each unique path is only created once (same optimisation as darwin).
@@ -57,10 +74,13 @@ func extractTarSeq(r io.Reader, dir string) error {
 			return errors.Wrap(err, "read tar entry")
 		}
 
-		target := filepath.Join(dir, hdr.Name)
-		if !strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), cleanDir) {
+		// Reject path traversal before passing to targetFn.
+		name := filepath.Clean(hdr.Name)
+		if strings.HasPrefix(name, "..") {
 			return errors.Errorf("tar entry %q escapes destination directory", hdr.Name)
 		}
+
+		target := targetFn(name)
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -69,6 +89,11 @@ func extractTarSeq(r io.Reader, dir string) error {
 			}
 
 		case tar.TypeReg:
+			if skipExisting {
+				if _, err := os.Lstat(target); err == nil {
+					continue
+				}
+			}
 			if err := ensureDir(filepath.Dir(target)); err != nil {
 				return errors.Errorf("mkdir %s: %w", hdr.Name, err)
 			}
@@ -85,6 +110,11 @@ func extractTarSeq(r io.Reader, dir string) error {
 			}
 
 		case tar.TypeSymlink:
+			if skipExisting {
+				if _, err := os.Lstat(target); err == nil {
+					continue
+				}
+			}
 			if err := ensureDir(filepath.Dir(target)); err != nil {
 				return errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
 			}

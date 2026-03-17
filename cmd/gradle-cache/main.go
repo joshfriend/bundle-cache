@@ -5,8 +5,8 @@
 // This format is compatible with the bundled-cache-manager Ruby script.
 //
 // On restore, the tool walks the local git history (counting distinct-author
-// "blocks") to find the most recent S3 hit, downloads it, extracts it to a
-// temporary directory, and symlinks $GRADLE_USER_HOME/caches into place.
+// "blocks") to find the most recent S3 hit, downloads it, and extracts it
+// directly into the final destination directories (no staging dir, no symlinks).
 // A restore marker file is written immediately after extraction; save-delta uses
 // its mtime as the baseline to identify files created during the build.
 //
@@ -233,9 +233,27 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	dlStart := time.Now()
 	slog.Info("downloading bundle", "commit", hitCommit[:min(8, len(hitCommit))])
 
-	tmpDir, err := os.MkdirTemp("", "gradle-cache-*")
+	// Ensure GRADLE_USER_HOME exists before extracting into it.
+	if err := os.MkdirAll(c.GradleUserHome, 0o750); err != nil {
+		return errors.Wrap(err, "create gradle user home dir")
+	}
+
+	// Resolve the project directory upfront; bundle entries are routed here for
+	// configuration-cache and convention build dirs.
+	projectDir, err := os.Getwd()
 	if err != nil {
-		return errors.Wrap(err, "create temp dir")
+		return errors.Wrap(err, "get working directory")
+	}
+
+	// Route tar entries to their final destinations directly:
+	//   ./caches/...               → GRADLE_USER_HOME/caches/...
+	//   ./configuration-cache/...  → <project>/.gradle/configuration-cache/...
+	//   everything else            → <project>/...  (buildSrc/build, plugins/*/build, …)
+	// Existing files are left untouched (skipExisting=true) so a partial
+	// pre-existing cache is merged rather than overwritten.
+	rules := []extractRule{
+		{prefix: "caches/", baseDir: c.GradleUserHome},
+		{prefix: "configuration-cache/", baseDir: filepath.Join(projectDir, ".gradle")},
 	}
 
 	body, err := store.get(ctx, hitCommit, c.CacheKey, hitSize)
@@ -247,7 +265,7 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	// countingBody records bytes consumed and timestamps when the S3 body is
 	// exhausted so we can log download speed independently of extraction.
 	cb := &countingBody{r: body, dlStart: dlStart}
-	if err := extractTarZstd(ctx, cb, tmpDir); err != nil {
+	if err := extractBundleZstd(ctx, cb, rules, projectDir); err != nil {
 		return errors.Wrap(err, "extract bundle")
 	}
 
@@ -267,23 +285,6 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	// total ≈ download time + a small flush of buffered pipeline stages.
 	slog.Info("restore pipeline complete",
 		"total_duration", totalElapsed.Round(time.Millisecond))
-
-	// Symlink $GRADLE_USER_HOME/caches → tmpDir/caches.
-	cachesTarget := filepath.Join(tmpDir, "caches")
-	if _, err := os.Stat(cachesTarget); err != nil {
-		return errors.Errorf("extracted bundle does not contain a caches/ directory: %w", err)
-	}
-	localCaches := filepath.Join(c.GradleUserHome, "caches")
-	if err := os.MkdirAll(c.GradleUserHome, 0o750); err != nil {
-		return errors.Wrap(err, "create gradle user home dir")
-	}
-	if err := os.RemoveAll(localCaches); err != nil {
-		return errors.Wrap(err, "remove existing caches dir")
-	}
-	if err := os.Symlink(cachesTarget, localCaches); err != nil {
-		return errors.Wrap(err, "symlink caches dir")
-	}
-	slog.Info("restored", "link", localCaches, "target", cachesTarget)
 
 	// Write a marker recording when the base restore finished.
 	// save-delta compares file mtimes against this to identify files created
@@ -321,57 +322,59 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		}
 	}
 
-	// Restore configuration-cache and convention build dirs from the current directory.
-	projectDir, err := os.Getwd()
-	if err != nil {
-		return errors.Wrap(err, "get working directory")
-	}
-	if err := restoreProjectDirs(tmpDir, projectDir, c.IncludedBuilds); err != nil {
-		return err
-	}
-
 	slog.Debug("restore complete", "total_duration", time.Since(totalStart))
 	return nil
 }
 
-// restoreProjectDirs symlinks configuration-cache and included build output dirs
-// from tmpDir into projectDir, if present in the extracted bundle.
-// includedBuilds specifies which directories to check (see conventionBuildDirs).
-func restoreProjectDirs(tmpDir, projectDir string, includedBuilds []string) error {
-	// configuration-cache: archived at ./configuration-cache/ relative to the bundle root
-	// (not under .gradle/), matching the bundled-cache-manager.rb archive format.
-	srcCC := filepath.Join(tmpDir, "configuration-cache")
-	if _, err := os.Stat(srcCC); err == nil {
-		dstCC := filepath.Join(projectDir, ".gradle", "configuration-cache")
-		if err := os.MkdirAll(filepath.Dir(dstCC), 0o750); err != nil {
-			return errors.Wrap(err, "create .gradle dir")
-		}
-		if err := os.RemoveAll(dstCC); err != nil {
-			return errors.Wrap(err, "remove existing configuration-cache")
-		}
-		if err := os.Symlink(srcCC, dstCC); err != nil {
-			return errors.Wrap(err, "symlink configuration-cache")
-		}
-		slog.Info("restored", "link", dstCC, "target", srcCC)
+// extractRule maps a tar entry path prefix to a destination base directory.
+// For an entry "prefix/rest/of/path", the file is placed at
+// filepath.Join(baseDir, "prefix/rest/of/path").
+type extractRule struct {
+	prefix  string // without leading "./"
+	baseDir string
+}
+
+// extractBundleZstd decompresses and extracts a base bundle, routing tar
+// entries to their final destinations based on rules. Any entry whose path does
+// not match a rule is placed under defaultDir. Existing files are not
+// overwritten (skipExisting semantics), so a partial pre-existing cache is
+// merged rather than replaced.
+func extractBundleZstd(ctx context.Context, r io.Reader, rules []extractRule, defaultDir string) error {
+	zstdCmd := zstdDecompressCmd(ctx)
+	zstdCmd.Stdin = r
+
+	var zstdStderr bytes.Buffer
+	zstdCmd.Stderr = &zstdStderr
+
+	zstdOut, err := zstdCmd.StdoutPipe()
+	if err != nil {
+		return errors.Wrap(err, "zstd stdout pipe")
 	}
 
-	// Included build output dirs present in the extracted bundle.
-	for _, rel := range conventionBuildDirs(tmpDir, includedBuilds) {
-		src := filepath.Join(tmpDir, rel)
-		dst := filepath.Join(projectDir, rel)
-		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
-			return errors.Errorf("create parent of %s: %w", dst, err)
-		}
-		if err := os.RemoveAll(dst); err != nil {
-			return errors.Errorf("remove existing %s: %w", dst, err)
-		}
-		if err := os.Symlink(src, dst); err != nil {
-			return errors.Errorf("symlink %s: %w", rel, err)
-		}
-		slog.Info("restored", "link", dst, "target", src)
+	if err := zstdCmd.Start(); err != nil {
+		return errors.Wrap(err, "start zstd")
 	}
 
-	return nil
+	targetFn := func(name string) string {
+		for _, rule := range rules {
+			if strings.HasPrefix(name, rule.prefix) {
+				return filepath.Join(rule.baseDir, name)
+			}
+		}
+		return filepath.Join(defaultDir, name)
+	}
+
+	extractErr := extractTarPlatformRouted(zstdOut, targetFn, true)
+	zstdErr := zstdCmd.Wait()
+
+	var errs []error
+	if extractErr != nil {
+		errs = append(errs, extractErr)
+	}
+	if zstdErr != nil {
+		errs = append(errs, errors.Errorf("zstd: %w: %s", zstdErr, zstdStderr.String()))
+	}
+	return errors.Join(errs...)
 }
 
 // RestoreDeltaCmd downloads and applies a branch-specific delta bundle on top of

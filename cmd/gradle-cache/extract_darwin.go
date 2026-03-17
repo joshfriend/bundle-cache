@@ -33,7 +33,16 @@ const mmapThreshold = 64 * 1024
 // handles concurrent writes to independent files efficiently, so parallel
 // workers saturate IOPS better than a single sequential writer would.
 func extractTarPlatform(r io.Reader, dir string) error {
-	return extractTarGo(r, dir)
+	return extractTarGoRouted(r, func(name string) string {
+		return filepath.Join(dir, name)
+	}, false)
+}
+
+// extractTarPlatformRouted is the routing-aware variant of extractTarPlatform.
+// targetFn maps a cleaned tar entry name to its absolute destination path.
+// If skipExisting is true, files that already exist on disk are left untouched.
+func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
+	return extractTarGoRouted(r, targetFn, skipExisting)
 }
 
 // extractTarGo reads a tar stream and extracts it into dir using a Go worker
@@ -49,6 +58,15 @@ func extractTarPlatform(r io.Reader, dir string) error {
 //     allocates one contiguous extent; the Mach VM subsystem then writes pages
 //     lazily via fault-in rather than blocking on each write() call.
 func extractTarGo(r io.Reader, dir string) error {
+	return extractTarGoRouted(r, func(name string) string {
+		return filepath.Join(dir, name)
+	}, false)
+}
+
+// extractTarGoRouted is the core parallel extractor. targetFn maps a cleaned
+// tar entry name (e.g. "caches/8.14.3/foo") to its absolute destination path.
+// skipExisting skips writing files that already exist on disk.
+func extractTarGoRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
 	type fileJob struct {
 		path string
 		mode os.FileMode
@@ -93,7 +111,6 @@ func extractTarGo(r io.Reader, dir string) error {
 	}
 
 	tr := tar.NewReader(r)
-	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
 	var readErr error
 readLoop:
 	for {
@@ -106,11 +123,14 @@ readLoop:
 			break
 		}
 
-		target := filepath.Join(dir, hdr.Name)
-		if !strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), cleanDir) {
+		// Reject path traversal before passing to targetFn.
+		name := filepath.Clean(hdr.Name)
+		if strings.HasPrefix(name, "..") {
 			readErr = errors.Errorf("tar entry %q escapes destination directory", hdr.Name)
 			break
 		}
+
+		target := targetFn(name)
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -120,6 +140,11 @@ readLoop:
 			}
 
 		case tar.TypeReg:
+			if skipExisting {
+				if _, err := os.Lstat(target); err == nil {
+					continue
+				}
+			}
 			if err := ensureDir(filepath.Dir(target)); err != nil {
 				readErr = errors.Errorf("mkdir %s: %w", hdr.Name, err)
 				break readLoop
@@ -138,6 +163,11 @@ readLoop:
 			jobs <- fileJob{path: target, mode: hdr.FileInfo().Mode(), buf: bufPtr}
 
 		case tar.TypeSymlink:
+			if skipExisting {
+				if _, err := os.Lstat(target); err == nil {
+					continue
+				}
+			}
 			if err := ensureDir(filepath.Dir(target)); err != nil {
 				readErr = errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
 				break readLoop

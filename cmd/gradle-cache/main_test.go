@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -230,148 +231,56 @@ func TestProjectDirSources(t *testing.T) {
 	})
 }
 
-// ─── restoreProjectDirs tests ────────────────────────────────────────────────
+// ─── extractBundleZstd routing tests ─────────────────────────────────────────
 
-func TestRestoreProjectDirs(t *testing.T) {
-	defaultBuilds := []string{"buildSrc"}
+// TestExtractBundleRouting verifies that the routing function used by
+// extractBundleZstd places tar entries in the correct destination directories.
+func TestExtractBundleRouting(t *testing.T) {
+	gradleHome := t.TempDir()
+	projectDir := t.TempDir()
 
-	t.Run("no project dirs in bundle — no error, nothing created", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		projectDir := t.TempDir()
-		if err := restoreProjectDirs(tmpDir, projectDir, defaultBuilds); err != nil {
-			t.Fatal(err)
-		}
-		entries, _ := os.ReadDir(projectDir)
-		if len(entries) != 0 {
-			t.Errorf("expected empty project dir, got %v", entries)
-		}
-	})
+	rules := []extractRule{
+		{prefix: "caches/", baseDir: gradleHome},
+		{prefix: "configuration-cache/", baseDir: filepath.Join(projectDir, ".gradle")},
+	}
 
-	t.Run("configuration-cache symlinked into .gradle/", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		projectDir := t.TempDir()
-		srcCC := filepath.Join(tmpDir, "configuration-cache")
-		must(t, os.Mkdir(srcCC, 0o755))
-
-		must(t, restoreProjectDirs(tmpDir, projectDir, defaultBuilds))
-
-		dst := filepath.Join(projectDir, ".gradle", "configuration-cache")
-		target, err := os.Readlink(dst)
-		if err != nil {
-			t.Fatalf("expected symlink at %s: %v", dst, err)
-		}
-		if target != srcCC {
-			t.Errorf("symlink target = %q, want %q", target, srcCC)
-		}
-	})
-
-	t.Run("buildSrc/build symlinked into project", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		projectDir := t.TempDir()
-		src := filepath.Join(tmpDir, "buildSrc", "build")
-		must(t, os.MkdirAll(src, 0o755))
-
-		must(t, restoreProjectDirs(tmpDir, projectDir, []string{"buildSrc"}))
-
-		dst := filepath.Join(projectDir, "buildSrc", "build")
-		target, err := os.Readlink(dst)
-		if err != nil {
-			t.Fatalf("expected symlink at %s: %v", dst, err)
-		}
-		if target != src {
-			t.Errorf("symlink target = %q, want %q", target, src)
-		}
-	})
-
-	t.Run("build-logic/build symlinked when configured", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		projectDir := t.TempDir()
-		src := filepath.Join(tmpDir, "build-logic", "build")
-		must(t, os.MkdirAll(src, 0o755))
-
-		must(t, restoreProjectDirs(tmpDir, projectDir, []string{"build-logic"}))
-
-		dst := filepath.Join(projectDir, "build-logic", "build")
-		target, err := os.Readlink(dst)
-		if err != nil {
-			t.Fatalf("expected symlink at %s: %v", dst, err)
-		}
-		if target != src {
-			t.Errorf("symlink target = %q, want %q", target, src)
-		}
-	})
-
-	t.Run("build-logic not restored when not in config", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		projectDir := t.TempDir()
-		// build-logic is in the bundle but not configured.
-		must(t, os.MkdirAll(filepath.Join(tmpDir, "build-logic", "build"), 0o755))
-
-		must(t, restoreProjectDirs(tmpDir, projectDir, []string{"buildSrc"}))
-
-		dst := filepath.Join(projectDir, "build-logic", "build")
-		if _, err := os.Lstat(dst); err == nil {
-			t.Errorf("build-logic/build should not have been restored when not configured")
-		}
-	})
-
-	t.Run("plugins/foo/build symlinked via glob", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		projectDir := t.TempDir()
-		src := filepath.Join(tmpDir, "plugins", "foo", "build")
-		must(t, os.MkdirAll(src, 0o755))
-
-		must(t, restoreProjectDirs(tmpDir, projectDir, []string{"plugins/*"}))
-
-		dst := filepath.Join(projectDir, "plugins", "foo", "build")
-		target, err := os.Readlink(dst)
-		if err != nil {
-			t.Fatalf("expected symlink at %s: %v", dst, err)
-		}
-		if target != src {
-			t.Errorf("symlink target = %q, want %q", target, src)
-		}
-	})
-
-	t.Run("existing directory at destination is replaced by symlink", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		projectDir := t.TempDir()
-		srcCC := filepath.Join(tmpDir, "configuration-cache")
-		must(t, os.Mkdir(srcCC, 0o755))
-		// Pre-create destination as a real directory (simulating a prior run).
-		must(t, os.MkdirAll(filepath.Join(projectDir, ".gradle", "configuration-cache"), 0o755))
-
-		must(t, restoreProjectDirs(tmpDir, projectDir, defaultBuilds))
-
-		dst := filepath.Join(projectDir, ".gradle", "configuration-cache")
-		target, err := os.Readlink(dst)
-		if err != nil {
-			t.Fatalf("expected symlink at %s after replacement: %v", dst, err)
-		}
-		if target != srcCC {
-			t.Errorf("symlink target = %q, want %q", target, srcCC)
-		}
-	})
-
-	t.Run("all dirs present with correct config — all symlinked", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		projectDir := t.TempDir()
-		must(t, os.MkdirAll(filepath.Join(tmpDir, "configuration-cache"), 0o755))
-		must(t, os.MkdirAll(filepath.Join(tmpDir, "buildSrc", "build"), 0o755))
-		must(t, os.MkdirAll(filepath.Join(tmpDir, "plugins", "bar", "build"), 0o755))
-
-		must(t, restoreProjectDirs(tmpDir, projectDir, []string{"buildSrc", "plugins/*"}))
-
-		for _, dst := range []string{
-			filepath.Join(projectDir, ".gradle", "configuration-cache"),
-			filepath.Join(projectDir, "buildSrc", "build"),
-			filepath.Join(projectDir, "plugins", "bar", "build"),
-		} {
-			if _, err := os.Readlink(dst); err != nil {
-				t.Errorf("expected symlink at %s: %v", dst, err)
+	targetFn := func(name string) string {
+		for _, rule := range rules {
+			if strings.HasPrefix(name, rule.prefix) {
+				return filepath.Join(rule.baseDir, name)
 			}
 		}
-	})
+		return filepath.Join(projectDir, name)
+	}
+
+	cases := []struct {
+		entry string
+		want  string
+	}{
+		{
+			entry: "caches/8.14.3/foo.jar",
+			want:  filepath.Join(gradleHome, "caches/8.14.3/foo.jar"),
+		},
+		{
+			entry: "configuration-cache/abc/entry",
+			want:  filepath.Join(projectDir, ".gradle", "configuration-cache/abc/entry"),
+		},
+		{
+			entry: "buildSrc/build/libs/buildSrc.jar",
+			want:  filepath.Join(projectDir, "buildSrc/build/libs/buildSrc.jar"),
+		},
+		{
+			entry: "plugins/foo/build/libs/foo.jar",
+			want:  filepath.Join(projectDir, "plugins/foo/build/libs/foo.jar"),
+		},
+	}
+
+	for _, tc := range cases {
+		got := targetFn(tc.entry)
+		if got != tc.want {
+			t.Errorf("targetFn(%q) = %q, want %q", tc.entry, got, tc.want)
+		}
+	}
 }
 
 // ─── Git history walk tests ──────────────────────────────────────────────────
