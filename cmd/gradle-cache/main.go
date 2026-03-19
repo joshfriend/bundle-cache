@@ -42,7 +42,8 @@ import (
 )
 
 type CLI struct {
-	LogLevel     string          `help:"Log level." default:"info" enum:"debug,info,warn,error"`
+	LogLevel     string `help:"Log level." default:"info" enum:"debug,info,warn,error"`
+	metricsFlags `embed:""`
 	Restore      RestoreCmd      `cmd:"" help:"Find the newest cached bundle in history and restore it to GRADLE_USER_HOME."`
 	RestoreDelta RestoreDeltaCmd `cmd:"" help:"Apply a branch delta bundle on top of an already-restored base cache."`
 	Save         SaveCmd         `cmd:"" help:"Bundle GRADLE_USER_HOME/caches and upload to S3 tagged with a commit SHA."`
@@ -131,7 +132,7 @@ func (c *RestoreCmd) AfterApply() error {
 	return nil
 }
 
-func (c *RestoreCmd) Run(ctx context.Context) error {
+func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 	totalStart := time.Now()
 
 	store, err := c.newStore()
@@ -287,6 +288,8 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	// total ≈ download time + a small flush of buffered pipeline stages.
 	slog.Info("restore pipeline complete",
 		"total_duration", totalElapsed.Round(time.Millisecond))
+	emitTiming(metrics, "gradle_cache.restore.duration_ms", totalElapsed.Milliseconds(), "cache_key:"+c.CacheKey)
+	emitGauge(metrics, "gradle_cache.restore.size_bytes", cb.n, "cache_key:"+c.CacheKey)
 
 	// Write a marker recording when the base restore finished.
 	// save-delta compares file mtimes against this to identify files created
@@ -409,7 +412,7 @@ func (c *RestoreDeltaCmd) AfterApply() error {
 	return nil
 }
 
-func (c *RestoreDeltaCmd) Run(ctx context.Context) error {
+func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics metricsClient) error {
 	// Require the base restore to have run first so the caches symlink exists.
 	cachesDir := filepath.Join(c.GradleUserHome, "caches")
 	if _, err := os.Stat(cachesDir); err != nil {
@@ -449,8 +452,11 @@ func (c *RestoreDeltaCmd) Run(ctx context.Context) error {
 			"size_mb", fmt.Sprintf("%.1f", float64(cb.n)/1e6),
 			"speed_mbps", fmt.Sprintf("%.1f", float64(cb.n)/dlElapsed.Seconds()/1e6))
 	}
+	deltaElapsed := time.Since(dlStart)
 	slog.Info("applied delta bundle", "branch", c.Branch, "cache-key", c.CacheKey,
-		"total_duration", time.Since(dlStart).Round(time.Millisecond))
+		"total_duration", deltaElapsed.Round(time.Millisecond))
+	emitTiming(metrics, "gradle_cache.restore_delta.duration_ms", deltaElapsed.Milliseconds(),
+		"cache_key:"+c.CacheKey, "branch:"+c.Branch)
 	return nil
 }
 
@@ -492,7 +498,7 @@ func (c *SaveCmd) AfterApply(ctx context.Context) error {
 	return nil
 }
 
-func (c *SaveCmd) Run(ctx context.Context) error {
+func (c *SaveCmd) Run(ctx context.Context, metrics metricsClient) error {
 	cachesDir := filepath.Join(c.GradleUserHome, "caches")
 	if _, err := os.Stat(cachesDir); err != nil {
 		return errors.Errorf("caches directory not found at %s: %w", cachesDir, err)
@@ -556,6 +562,8 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 		"size_mb", fmt.Sprintf("%.1f", float64(size)/1e6),
 		"speed_mbps", fmt.Sprintf("%.1f", mbps))
 	slog.Info("saved bundle", "commit", c.Commit[:min(8, len(c.Commit))], "cache-key", c.CacheKey)
+	emitTiming(metrics, "gradle_cache.save.duration_ms", elapsed.Milliseconds(), "cache_key:"+c.CacheKey)
+	emitGauge(metrics, "gradle_cache.save.size_bytes", size, "cache_key:"+c.CacheKey)
 	return nil
 }
 
@@ -592,7 +600,7 @@ func (c *SaveDeltaCmd) AfterApply() error {
 	return nil
 }
 
-func (c *SaveDeltaCmd) Run(ctx context.Context) error {
+func (c *SaveDeltaCmd) Run(ctx context.Context, metrics metricsClient) error {
 	// Read the restore marker to establish the mtime baseline.
 	markerPath := filepath.Join(c.GradleUserHome, ".cache-restore-marker")
 	markerInfo, err := os.Stat(markerPath)
@@ -666,6 +674,10 @@ func (c *SaveDeltaCmd) Run(ctx context.Context) error {
 		"duration", elapsed.Round(time.Millisecond),
 		"size_mb", fmt.Sprintf("%.1f", float64(size)/1e6),
 		"speed_mbps", fmt.Sprintf("%.1f", mbps))
+	emitTiming(metrics, "gradle_cache.save_delta.duration_ms", elapsed.Milliseconds(),
+		"cache_key:"+c.CacheKey, "branch:"+c.Branch)
+	emitGauge(metrics, "gradle_cache.save_delta.size_bytes", size,
+		"cache_key:"+c.CacheKey, "branch:"+c.Branch)
 	return nil
 }
 
@@ -699,7 +711,13 @@ func main() {
 		kong.BindTo(ctx, (*context.Context)(nil)), // needed by SaveCmd.AfterApply
 	)
 	setupLogger(cli.LogLevel)
-	kctx.FatalIfErrorf(kctx.Run(ctx))
+
+	metrics := cli.metricsFlags.newMetricsClient()
+	if metrics != nil {
+		defer metrics.close()
+	}
+
+	kctx.FatalIfErrorf(kctx.Run(ctx, metrics))
 }
 
 // setupLogger configures the global slog logger at the requested level.
