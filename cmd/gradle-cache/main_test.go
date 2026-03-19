@@ -429,9 +429,11 @@ func TestTarZstdRoundTrip(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Join(gradleHome, "caches", "modules"), 0o755))
 	must(t, os.WriteFile(filepath.Join(gradleHome, "caches", "modules", "entry.bin"), []byte("gradle data"), 0o644))
 
-	// wrapper/ source (under gradle-home)
-	must(t, os.MkdirAll(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin"), 0o755))
-	must(t, os.WriteFile(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "gradle-core.jar"), []byte("wrapper data"), 0o644))
+	// wrapper/ source (under gradle-home) — includes a .zip that should be excluded
+	must(t, os.MkdirAll(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123"), 0o755))
+	must(t, os.WriteFile(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123", "gradle-8.14.3-bin.zip"), []byte("should be excluded"), 0o644))
+	must(t, os.MkdirAll(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123", "gradle-8.14.3", "lib"), 0o755))
+	must(t, os.WriteFile(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123", "gradle-8.14.3", "lib", "gradle-core.jar"), []byte("wrapper data"), 0o644))
 
 	// configuration-cache/ source (under .gradle/ inside project)
 	gradleDir := filepath.Join(srcDir, "project", ".gradle")
@@ -456,16 +458,22 @@ func TestTarZstdRoundTrip(t *testing.T) {
 		t.Fatalf("extractTarZstd: %v", err)
 	}
 
-	// Verify both source trees are present at the bundle root level.
+	// Verify expected files are present in the extracted archive.
 	for _, rel := range []string{
 		"caches/modules/entry.bin",
-		"wrapper/dists/gradle-8.14.3-bin/gradle-core.jar",
+		"wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3/lib/gradle-core.jar",
 		"configuration-cache/hash.bin",
 	} {
 		path := filepath.Join(dstDir, rel)
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("expected %s in extracted dir: %v", rel, err)
 		}
+	}
+
+	// Verify wrapper zip was excluded from the archive.
+	excludedZip := filepath.Join(dstDir, "wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3-bin.zip")
+	if _, err := os.Stat(excludedZip); err == nil {
+		t.Error("wrapper zip should have been excluded from archive")
 	}
 
 	// Verify file contents round-trip correctly.

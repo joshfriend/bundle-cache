@@ -875,6 +875,10 @@ var cacheExclusions = []string{
 	"*.lock",
 }
 
+// wrapperZipExclusion is a path-based tar --exclude pattern that removes
+// downloaded wrapper distribution zips. Only the unpacked distribution is needed.
+const wrapperZipExclusion = "wrapper/dists/*/*/*.zip"
+
 // isExcludedCache reports whether a file or directory name matches any cache exclusion pattern.
 func isExcludedCache(name string) bool {
 	for _, pat := range cacheExclusions {
@@ -899,6 +903,7 @@ func createTarZstd(ctx context.Context, w io.Writer, sources []tarSource) error 
 	for _, pat := range cacheExclusions {
 		args = append(args, "--exclude", pat)
 	}
+	args = append(args, "--exclude", wrapperZipExclusion)
 	for _, src := range sources {
 		args = append(args, "-C", src.BaseDir, src.Path)
 	}
