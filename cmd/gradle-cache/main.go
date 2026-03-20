@@ -2,7 +2,6 @@
 //
 // Base bundles are stored at s3://{bucket}/{commit}/{cache-key}/{bundle-file},
 // where bundle-file is the cache key with colons replaced by dashes + ".tar.zst".
-// This format is compatible with the bundled-cache-manager Ruby script.
 //
 // On restore, the tool walks the local git history (counting distinct-author
 // "blocks") to find the most recent S3 hit, downloads it, and extracts it
@@ -109,7 +108,7 @@ type RestoreCmd struct {
 	MaxBlocks      int      `help:"Number of distinct-author commit blocks to search." default:"20"`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
 	IncludedBuilds []string `help:"Included build directories whose build/ output to restore (relative to project root). Use 'dir/*' to restore build/ for all subdirectories. May be repeated." name:"included-build"`
-	Branch         string   `help:"Branch name to also apply a delta bundle for (typically $$BRANCH_NAME). The delta download runs concurrently with base extraction." optional:""`
+	Branch         string   `help:"Branch name to also apply a delta bundle for (typically $BRANCH_NAME). The delta download runs concurrently with base extraction." optional:""`
 }
 
 func (c *RestoreCmd) AfterApply() error {
@@ -169,7 +168,7 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 		slog.Info("no cache bundle found in history")
 		return nil
 	}
-	slog.Info("cache hit", "commit", hitCommit[:min(8, len(hitCommit))], "cache-key", c.CacheKey)
+	slog.Info("cache hit", "commit", hitCommit, "cache-key", c.CacheKey)
 
 	// ── Delta pre-fetch (concurrent with base extraction) ─────────────────────
 	// If --branch is set, kick off a goroutine that stats + downloads the delta
@@ -346,7 +345,10 @@ type extractRule struct {
 // merged rather than replaced.
 func extractBundleZstd(ctx context.Context, r io.Reader, rules []extractRule, defaultDir string) error {
 	zstdCmd := zstdDecompressCmd(ctx)
-	zstdCmd.Stdin = r
+	// Buffer between S3 download and pzstd to decouple network I/O from
+	// decompression. Without this, any momentary pause in pzstd (context
+	// switch, hard block) stalls the S3 read on the synchronous pipe.
+	zstdCmd.Stdin = bufio.NewReaderSize(r, 8<<20)
 
 	var zstdStderr bytes.Buffer
 	zstdCmd.Stderr = &zstdStderr
@@ -745,7 +747,7 @@ func setupLogger(level string) {
 	slog.SetDefault(slog.New(handler))
 }
 
-// bundleFilename converts a cache key to its S3 filename, matching the Ruby bundled-cache-manager.
+// bundleFilename converts a cache key to its S3 filename.
 func bundleFilename(cacheKey string) string {
 	return strings.ReplaceAll(cacheKey, ":", "-") + ".tar.zst"
 }
@@ -843,7 +845,7 @@ func (c *countingBody) Read(p []byte) (int, error) {
 
 func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
 	zstdCmd := zstdDecompressCmd(ctx)
-	zstdCmd.Stdin = r
+	zstdCmd.Stdin = bufio.NewReaderSize(r, 8<<20)
 
 	var zstdStderr bytes.Buffer
 	zstdCmd.Stderr = &zstdStderr

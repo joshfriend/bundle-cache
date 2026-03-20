@@ -10,6 +10,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,9 +34,11 @@ type awsCreds struct {
 
 // s3Client is a minimal AWS S3 client supporting HeadObject, GetObject, and PutObject.
 type s3Client struct {
-	region string
-	creds  awsCreds
-	http   *http.Client
+	region    string
+	creds     awsCreds
+	http      *http.Client
+	chunkSize int64
+	dlWorkers int
 }
 
 func newS3Client(region string) (*s3Client, error) {
@@ -43,10 +46,22 @@ func newS3Client(region string) (*s3Client, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "resolve AWS credentials")
 	}
+	workers := max(defaultDownloadWorkers, runtime.NumCPU())
+
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: workers,
+		WriteBufferSize:     128 << 10,
+		ReadBufferSize:      128 << 10,
+	}
+
+	slog.Debug("s3 client config", "workers", workers, "chunk_mb", defaultDownloadChunkSize>>20)
+
 	return &s3Client{
-		region: region,
-		creds:  creds,
-		http:   &http.Client{},
+		region:    region,
+		creds:     creds,
+		http:      &http.Client{Transport: transport},
+		chunkSize: defaultDownloadChunkSize,
+		dlWorkers: workers,
 	}, nil
 }
 
@@ -71,14 +86,8 @@ func (c *s3Client) stat(ctx context.Context, bucket, key string) (int64, error) 
 }
 
 const (
-	// downloadChunkSize is the size of each parallel range request.
-	// 32 MiB gives ~8 in-flight buffers = 256 MiB peak memory, matching the
-	// AWS S3 Transfer Manager default.
-	downloadChunkSize = 32 << 20
-	// downloadWorkers is the number of concurrent range requests.
-	// max(8, NumCPU) saturates S3 bandwidth on CI instances where a single
-	// TCP flow is throttled well below the available network capacity.
-	downloadWorkers = 8
+	defaultDownloadChunkSize = 32 << 20
+	defaultDownloadWorkers   = 16
 )
 
 // get downloads an object and returns its body as a streaming ReadCloser.
@@ -89,7 +98,7 @@ const (
 // The caller must close the returned reader.
 func (c *s3Client) get(ctx context.Context, bucket, key string, size int64) (io.ReadCloser, error) {
 	// Small object or unknown size: single-stream GET.
-	if size <= downloadChunkSize {
+	if size <= c.chunkSize {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
 		if err != nil {
 			return nil, err
@@ -121,8 +130,8 @@ func (c *s3Client) get(ctx context.Context, bucket, key string, size int64) (io.
 // stays active at full speed. All workers run concurrently, saturating the
 // available S3 bandwidth. Peak memory is numWorkers × downloadChunkSize.
 func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int64, w io.Writer) error {
-	numChunks := int((size + downloadChunkSize - 1) / downloadChunkSize)
-	numWorkers := max(downloadWorkers, runtime.NumCPU())
+	numChunks := int((size + c.chunkSize - 1) / c.chunkSize)
+	numWorkers := max(c.dlWorkers, runtime.NumCPU())
 
 	type chunkResult struct {
 		data []byte
@@ -149,8 +158,8 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int
 		go func() {
 			defer wg.Done()
 			for seq := range work {
-				start := int64(seq) * downloadChunkSize
-				end := min(start+downloadChunkSize-1, size-1)
+				start := int64(seq) * c.chunkSize
+				end := min(start+c.chunkSize-1, size-1)
 
 				req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
 				if err != nil {
