@@ -955,6 +955,10 @@ func createTarZstd(ctx context.Context, w io.Writer, sources []tarSource) error 
 
 	_, copyErr := io.Copy(enc, tarStdout)
 	encErr := enc.Close()
+	// Close the pipe so tar sees EOF on its stdout and exits cleanly.
+	// Without this, if copyErr or encErr is non-nil, tar may block
+	// forever writing to a full pipe and tarCmd.Wait() will hang.
+	tarStdout.Close() //nolint:errcheck,gosec
 	tarErr := tarCmd.Wait()
 
 	var errs []error
