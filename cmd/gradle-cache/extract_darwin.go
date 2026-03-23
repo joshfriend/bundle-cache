@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 
@@ -106,9 +105,9 @@ readLoop:
 		}
 
 		// Reject path traversal before passing to targetFn.
-		name := filepath.Clean(hdr.Name)
-		if strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
-			readErr = errors.Errorf("tar entry %q escapes destination directory", hdr.Name)
+		name, err := safeTarEntryName(hdr.Name)
+		if err != nil {
+			readErr = err
 			break
 		}
 
@@ -150,16 +149,8 @@ readLoop:
 					continue
 				}
 			}
-			// Validate symlink target does not escape the archive root.
-			// Resolve in tar-entry namespace (before routing) so validation
-			// is independent of which destination directory entries are routed to.
-			if filepath.IsAbs(hdr.Linkname) {
-				readErr = errors.Errorf("symlink %q -> %q: absolute symlink target not allowed", hdr.Name, hdr.Linkname)
-				break readLoop
-			}
-			resolvedLink := filepath.Clean(filepath.Join(filepath.Dir(name), hdr.Linkname))
-			if strings.HasPrefix(resolvedLink, "..") {
-				readErr = errors.Errorf("symlink %q -> %q escapes destination directory", hdr.Name, hdr.Linkname)
+			if err := safeSymlinkTarget(name, hdr.Linkname); err != nil {
+				readErr = err
 				break readLoop
 			}
 			if err := ensureDir(filepath.Dir(target)); err != nil {

@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/alecthomas/errors"
@@ -118,9 +117,9 @@ loop:
 			break
 		}
 
-		name := filepath.Clean(hdr.Name)
-		if strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
-			readErr = errors.Errorf("tar entry %q escapes destination directory", hdr.Name)
+		name, err := safeTarEntryName(hdr.Name)
+		if err != nil {
+			readErr = err
 			break
 		}
 
@@ -185,16 +184,8 @@ loop:
 					continue
 				}
 			}
-			// Validate symlink target does not escape the archive root.
-			// Resolve in tar-entry namespace (before routing) so validation
-			// is independent of which destination directory entries are routed to.
-			if filepath.IsAbs(hdr.Linkname) {
-				readErr = errors.Errorf("symlink %q -> %q: absolute symlink target not allowed", hdr.Name, hdr.Linkname)
-				break loop
-			}
-			resolvedLink := filepath.Clean(filepath.Join(filepath.Dir(name), hdr.Linkname))
-			if strings.HasPrefix(resolvedLink, "..") {
-				readErr = errors.Errorf("symlink %q -> %q escapes destination directory", hdr.Name, hdr.Linkname)
+			if err := safeSymlinkTarget(name, hdr.Linkname); err != nil {
+				readErr = err
 				break loop
 			}
 			if err := ensureDir(filepath.Dir(target)); err != nil {
