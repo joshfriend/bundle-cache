@@ -35,11 +35,12 @@ type awsCreds struct {
 
 // s3Client is a minimal AWS S3 client supporting HeadObject, GetObject, and PutObject.
 type s3Client struct {
-	region    string
-	creds     awsCreds
-	http      *http.Client
-	chunkSize int64
-	dlWorkers int
+	region      string
+	creds       awsCreds
+	http        *http.Client
+	chunkSize   int64
+	dlWorkers   int
+	testBaseURL string // non-empty in tests: overrides the virtual-hosted URL prefix and skips signing
 }
 
 func newS3Client(region string) (*s3Client, error) {
@@ -522,13 +523,20 @@ func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string
 // objectURL returns the virtual-hosted S3 URL for the given bucket and key.
 // Each path segment is percent-encoded using the AWS SigV4 URI encoding rules
 // (only A-Za-z0-9 - . _ ~ are left unencoded).
+// In tests, testBaseURL overrides the scheme+host to point at a local server.
 func (c *s3Client) objectURL(bucket, key string) string {
 	var sb strings.Builder
-	sb.WriteString("https://")
-	sb.WriteString(bucket)
-	sb.WriteString(".s3.")
-	sb.WriteString(c.region)
-	sb.WriteString(".amazonaws.com")
+	if c.testBaseURL != "" {
+		sb.WriteString(strings.TrimRight(c.testBaseURL, "/"))
+		sb.WriteByte('/')
+		sb.WriteString(bucket)
+	} else {
+		sb.WriteString("https://")
+		sb.WriteString(bucket)
+		sb.WriteString(".s3.")
+		sb.WriteString(c.region)
+		sb.WriteString(".amazonaws.com")
+	}
 	for _, seg := range strings.Split(key, "/") {
 		sb.WriteByte('/')
 		sb.WriteString(s3PathEscape(seg))
@@ -584,7 +592,12 @@ func awsQueryEscape(s string) string {
 
 // sign adds AWS Signature Version 4 headers to req using UNSIGNED-PAYLOAD,
 // which is permitted for all requests over HTTPS.
+// When testBaseURL is set the request targets a local test server that does not
+// verify signatures, so signing is skipped.
 func (c *s3Client) sign(req *http.Request) {
+	if c.testBaseURL != "" {
+		return
+	}
 	now := time.Now().UTC()
 	date := now.Format("20060102")
 	datetime := now.Format("20060102T150405Z")

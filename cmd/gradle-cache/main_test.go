@@ -6,11 +6,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -1069,6 +1073,175 @@ func BenchmarkExtractVsSymlink(b *testing.B) {
 			b.ReportMetric(float64(nFiles), "files/op")
 			b.ReportMetric(float64(totalBytes)/1e6, "MB/op")
 		})
+	}
+}
+
+// ─── S3 bundle store tests ────────────────────────────────────────────────────
+
+// fakeS3 is a minimal in-memory S3-compatible HTTP server for testing.
+// It supports HEAD, GET (with Range header), single-part PUT, and S3 multipart
+// upload (CreateMultipartUpload, UploadPart, CompleteMultipartUpload).
+type fakeS3 struct {
+	mu        sync.Mutex
+	objects   map[string][]byte         // finalized objects
+	mpUploads map[string]map[int][]byte // uploadID → partNum → data (in-progress)
+	mpKeys    map[string]string         // uploadID → object key
+}
+
+func newFakeS3() *fakeS3 {
+	return &fakeS3{
+		objects:   make(map[string][]byte),
+		mpUploads: make(map[string]map[int][]byte),
+		mpKeys:    make(map[string]string),
+	}
+}
+
+func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(r.URL.Path, "/")
+	q := r.URL.Query()
+
+	switch {
+	case r.Method == http.MethodHead:
+		f.mu.Lock()
+		_, ok := f.objects[key]
+		f.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+
+	case r.Method == http.MethodGet:
+		f.mu.Lock()
+		data, ok := f.objects[key]
+		f.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+			var start, end int64
+			if n, _ := fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end); n != 2 {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+			if end >= int64(len(data)) {
+				end = int64(len(data)) - 1
+			}
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[start : end+1])
+		} else {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+			_, _ = w.Write(data)
+		}
+
+	case r.Method == http.MethodPut && q.Get("uploadId") != "":
+		// UploadPart
+		partNum := 0
+		fmt.Sscanf(q.Get("partNumber"), "%d", &partNum) //nolint:errcheck
+		body, _ := io.ReadAll(r.Body)
+		uploadID := q.Get("uploadId")
+		f.mu.Lock()
+		if f.mpUploads[uploadID] == nil {
+			f.mpUploads[uploadID] = make(map[int][]byte)
+		}
+		f.mpUploads[uploadID][partNum] = body
+		f.mu.Unlock()
+		w.Header().Set("ETag", fmt.Sprintf(`"part-%d"`, partNum))
+		w.WriteHeader(http.StatusOK)
+
+	case r.Method == http.MethodPut:
+		// Single-part PUT
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.objects[key] = body
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+
+	case r.Method == http.MethodPost && q.Has("uploads"):
+		// CreateMultipartUpload
+		uploadID := fmt.Sprintf("upload-%d", len(f.mpUploads))
+		f.mu.Lock()
+		f.mpUploads[uploadID] = make(map[int][]byte)
+		f.mpKeys[uploadID] = key
+		f.mu.Unlock()
+		fmt.Fprintf(w, `<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, uploadID)
+
+	case r.Method == http.MethodPost && q.Get("uploadId") != "":
+		// CompleteMultipartUpload: assemble parts in order
+		uploadID := q.Get("uploadId")
+		f.mu.Lock()
+		parts := f.mpUploads[uploadID]
+		objKey := f.mpKeys[uploadID]
+		delete(f.mpUploads, uploadID)
+		delete(f.mpKeys, uploadID)
+		f.mu.Unlock()
+		// Sort part numbers and concatenate.
+		maxPart := 0
+		for pn := range parts {
+			if pn > maxPart {
+				maxPart = pn
+			}
+		}
+		var assembled []byte
+		for i := 1; i <= maxPart; i++ {
+			assembled = append(assembled, parts[i]...)
+		}
+		f.mu.Lock()
+		f.objects[objKey] = assembled
+		f.mu.Unlock()
+		fmt.Fprintf(w, `<CompleteMultipartUploadResult><Key>%s</Key></CompleteMultipartUploadResult>`, objKey)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// newTestS3BundleStore returns an s3BundleStore pointing at a fake S3 server.
+func newTestS3BundleStore(server *httptest.Server) *s3BundleStore {
+	client := &s3Client{
+		region:      "us-east-1",
+		http:        server.Client(),
+		chunkSize:   defaultDownloadChunkSize,
+		dlWorkers:   defaultDownloadWorkers,
+		testBaseURL: server.URL,
+	}
+	return &s3BundleStore{client: client, bucket: "test-bucket"}
+}
+
+func TestS3BundleStoreRoundTrip(t *testing.T) {
+	fs := newFakeS3()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+	store := newTestS3BundleStore(srv)
+
+	ctx := context.Background()
+	commit := "abc1234567890000000000000000000000000000"
+	cacheKey := "apos-beta"
+	payload := []byte("bundle contents")
+
+	legacyKey := "test-bucket/" + s3Key(commit, cacheKey, bundleFilename(cacheKey))
+	fs.mu.Lock()
+	fs.objects[legacyKey] = payload
+	fs.mu.Unlock()
+
+	_, err := store.stat(ctx, commit, cacheKey)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	r, err := store.get(ctx, commit, cacheKey, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer r.Close() //nolint:errcheck
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("got %q, want %q", got, payload)
 	}
 }
 
