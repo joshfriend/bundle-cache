@@ -93,11 +93,11 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 
 	// createdDirs is accessed only by the main goroutine, so no mutex needed.
 	createdDirs := make(map[string]struct{})
-	ensureDir := func(d string) error {
+	ensureDir := func(d string, mode os.FileMode) error {
 		if _, ok := createdDirs[d]; ok {
 			return nil
 		}
-		if err := os.MkdirAll(d, 0o750); err != nil {
+		if err := os.MkdirAll(d, mode); err != nil { //nolint:gosec // path is validated by caller
 			return err
 		}
 		createdDirs[d] = struct{}{}
@@ -127,7 +127,7 @@ loop:
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := ensureDir(target); err != nil {
+			if err := ensureDir(target, hdr.FileInfo().Mode()); err != nil {
 				readErr = errors.Errorf("mkdir %s: %w", hdr.Name, err)
 				break loop
 			}
@@ -139,7 +139,7 @@ loop:
 					continue
 				}
 			}
-			if err := ensureDir(filepath.Dir(target)); err != nil {
+			if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
 				readErr = errors.Errorf("mkdir %s: %w", hdr.Name, err)
 				break loop
 			}
@@ -188,7 +188,7 @@ loop:
 				readErr = err
 				break loop
 			}
-			if err := ensureDir(filepath.Dir(target)); err != nil {
+			if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
 				readErr = errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
 				break loop
 			}
