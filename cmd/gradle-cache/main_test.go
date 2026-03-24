@@ -496,14 +496,20 @@ func TestTarZstdRoundTrip(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123", "gradle-8.14.3", "lib", "gradle-core.jar"), []byte("wrapper data"), 0o644))
 
 	// configuration-cache/ source (under .gradle/ inside project)
-	gradleDir := filepath.Join(srcDir, "project", ".gradle")
+	projectDir := filepath.Join(srcDir, "project")
+	gradleDir := filepath.Join(projectDir, ".gradle")
 	must(t, os.MkdirAll(filepath.Join(gradleDir, "configuration-cache"), 0o755))
 	must(t, os.WriteFile(filepath.Join(gradleDir, "configuration-cache", "hash.bin"), []byte("config cache"), 0o644))
+
+	// included build (buildSrc) output directory
+	must(t, os.MkdirAll(filepath.Join(projectDir, "buildSrc", "build", "libs"), 0o755))
+	must(t, os.WriteFile(filepath.Join(projectDir, "buildSrc", "build", "libs", "buildSrc.jar"), []byte("buildsrc jar"), 0o644))
 
 	sources := []tarSource{
 		{BaseDir: gradleHome, Path: "./caches"},
 		{BaseDir: gradleHome, Path: "./wrapper"},
 		{BaseDir: gradleDir, Path: "./configuration-cache"},
+		{BaseDir: projectDir, Path: "./buildSrc/build"},
 	}
 
 	// Create archive into a buffer.
@@ -524,6 +530,7 @@ func TestTarZstdRoundTrip(t *testing.T) {
 		"wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3/lib/gradle-core.jar",
 		"wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3-bin.zip.ok",
 		"configuration-cache/hash.bin",
+		"buildSrc/build/libs/buildSrc.jar",
 	} {
 		path := filepath.Join(dstDir, rel)
 		if _, err := os.Stat(path); err != nil {
