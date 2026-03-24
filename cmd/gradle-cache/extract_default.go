@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/alecthomas/errors"
 	"golang.org/x/sync/errgroup"
@@ -22,12 +21,13 @@ const (
 	maxParallelFileSize = 4 << 20 // 4 MiB
 )
 
-// extractWorkerCount returns the number of parallel file-write goroutines to
-// use. The value scales with available CPUs rather than being a static
-// constant, avoiding over-subscription on smaller machines and k8s pods where
-// many other processes run concurrently.
+// extractWorkerCount returns the number of parallel file-write goroutines.
+// Benchmarking showed extraction throughput is IOPS-bound on small file
+// creation — the full S3 pipeline is IOPS-bound on XFS RAID0 and worker
+// count has no measurable effect from 8 to 128. We use 16 as a sensible
+// default above the measured knee at 8.
 func extractWorkerCount() int {
-	return max(16, runtime.NumCPU())
+	return 16
 }
 
 // extractTarPlatform uses parallel extraction on Linux.

@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"syscall"
 
@@ -27,6 +26,12 @@ var extractBufPool = sync.Pool{
 // faster than write() on macOS APFS. Below this threshold, mmap setup overhead
 // exceeds the savings. 64 KB covers most Gradle .jar files.
 const mmapThreshold = 64 * 1024
+
+// darwinExtractWorkers controls the number of parallel file-write goroutines
+// on macOS. Benchmarking on Apple M3 Max (APFS) showed the sweet spot at 8
+// workers — performance degrades sharply above that due to APFS B-tree
+// lock contention on concurrent file creates.
+var darwinExtractWorkers = 8
 
 // extractTarPlatform uses the optimised parallel extractor on macOS. APFS
 // handles concurrent writes to independent files efficiently, so parallel
@@ -54,7 +59,7 @@ func extractTarGoRouted(r io.Reader, targetFn func(string) string, skipExisting 
 		buf  *[]byte // must be returned to extractBufPool after use
 	}
 
-	numWorkers := max(16, runtime.NumCPU())
+	numWorkers := darwinExtractWorkers
 	jobs := make(chan fileJob, numWorkers*2)
 
 	var workerErrs []error

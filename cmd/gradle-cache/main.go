@@ -721,11 +721,14 @@ func projectDirSources(projectDir string, includedBuilds []string) []tarSource {
 }
 
 func main() {
-	// Ensure GOMAXPROCS is at least 32 for I/O-bound workloads, regardless
-	// of cgroup CPU limits. The file-write goroutine pool and zstd decoder
-	// need OS threads for blocking syscalls, not CPU time.
-	if runtime.GOMAXPROCS(0) < 32 {
-		runtime.GOMAXPROCS(32)
+	// Ensure GOMAXPROCS is high enough for our I/O-bound goroutine pool
+	// (extract workers + download workers + zstd decoder), regardless of
+	// cgroup CPU limits. Benchmarking showed no difference between 32 and
+	// NumCPU (see BENCHMARKING.md), but very low values (e.g. 1–2 in
+	// CPU-limited pods) starve the pipeline. A floor of 16 matches the
+	// total active goroutine count after lowering worker defaults.
+	if runtime.GOMAXPROCS(0) < 16 {
+		runtime.GOMAXPROCS(16)
 	}
 
 	cli := &CLI{}

@@ -87,7 +87,12 @@ func (c *s3Client) stat(ctx context.Context, bucket, key string) (int64, error) 
 
 const (
 	defaultDownloadChunkSize = 32 << 20
-	defaultDownloadWorkers   = 64
+	// defaultDownloadWorkers is the number of concurrent S3 Range GET
+	// requests. Benchmarking (see BENCHMARKING.md, phase 4) showed no
+	// throughput difference from 4 to 128 workers — extraction IOPS is the
+	// bottleneck, not download bandwidth. 8 workers keeps the connection
+	// count low on shared CI nodes while staying well above the knee.
+	defaultDownloadWorkers = 8
 )
 
 // get downloads an object and returns its body as a streaming ReadCloser.
