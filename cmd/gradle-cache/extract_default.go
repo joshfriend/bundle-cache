@@ -4,13 +4,14 @@ package main
 
 import (
 	"archive/tar"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 
 	"github.com/alecthomas/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -21,9 +22,10 @@ const (
 	maxParallelFileSize = 4 << 20 // 4 MiB
 )
 
-// extractWorkerCount returns the number of parallel file-write goroutines.
-// Scales with available CPUs to avoid over-subscription on smaller machines
-// and k8s pods where other processes run concurrently.
+// extractWorkerCount returns the number of parallel file-write goroutines to
+// use. The value scales with available CPUs rather than being a static
+// constant, avoiding over-subscription on smaller machines and k8s pods where
+// many other processes run concurrently.
 func extractWorkerCount() int {
 	return max(16, runtime.NumCPU())
 }
@@ -43,6 +45,12 @@ func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExi
 	return extractTarParallelRouted(r, targetFn, skipExisting)
 }
 
+type writeJob struct {
+	target string
+	mode   os.FileMode
+	data   []byte
+}
+
 // extractTarParallelRouted reads a tar stream and writes files using a pool of
 // goroutines. The main goroutine reads tar entries and buffers small file
 // contents; workers write those files to disk concurrently. Large files are
@@ -53,41 +61,28 @@ func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExi
 // allowing the upstream download+decompression pipeline to run at full speed
 // instead of being throttled by sequential I/O.
 func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
-	type writeJob struct {
-		target string
-		mode   os.FileMode
-		data   []byte
-	}
-
 	numWorkers := extractWorkerCount()
 	jobs := make(chan writeJob, numWorkers*2)
 
-	var (
-		wg           sync.WaitGroup
-		writeErrOnce sync.Once
-		writeErr     error
-	)
+	g, ctx := errgroup.WithContext(context.Background())
 
 	for range numWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		g.Go(func() error {
 			for job := range jobs {
 				f, err := os.OpenFile(job.target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, job.mode)
 				if err != nil {
-					writeErrOnce.Do(func() { writeErr = errors.Errorf("open %s: %w", filepath.Base(job.target), err) })
-					continue
+					return errors.Errorf("open %s: %w", filepath.Base(job.target), err)
 				}
 				if _, err := f.Write(job.data); err != nil {
 					f.Close() //nolint:errcheck,gosec
-					writeErrOnce.Do(func() { writeErr = errors.Errorf("write %s: %w", filepath.Base(job.target), err) })
-					continue
+					return errors.Errorf("write %s: %w", filepath.Base(job.target), err)
 				}
 				if err := f.Close(); err != nil {
-					writeErrOnce.Do(func() { writeErr = errors.Errorf("close %s: %w", filepath.Base(job.target), err) })
+					return errors.Errorf("close %s: %w", filepath.Base(job.target), err)
 				}
 			}
-		}()
+			return nil
+		})
 	}
 
 	copyBuf := make([]byte, 1<<20) // reused only for inline large-file writes
@@ -105,127 +100,137 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 		return nil
 	}
 
-	tr := tar.NewReader(r)
-	var readErr error
-loop:
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			readErr = errors.Wrap(err, "read tar entry")
-			break
-		}
-
-		name, err := safeTarEntryName(hdr.Name)
-		if err != nil {
-			readErr = err
-			break
-		}
-
-		target := targetFn(name)
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := ensureDir(target, hdr.FileInfo().Mode()); err != nil {
-				readErr = errors.Errorf("mkdir %s: %w", hdr.Name, err)
-				break loop
-			}
-
-		case tar.TypeReg:
-			if skipExisting {
-				if _, err := os.Lstat(target); err == nil {
-					// tar.Reader.Next() discards unread data automatically.
-					continue
-				}
-			}
-			if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
-				readErr = errors.Errorf("mkdir %s: %w", hdr.Name, err)
-				break loop
-			}
-
-			if hdr.Size <= maxParallelFileSize {
-				// Buffer in memory and dispatch to worker pool so the main
-				// goroutine can continue reading the tar stream immediately.
-				buf := make([]byte, hdr.Size)
-				if _, err := io.ReadFull(tr, buf); err != nil {
-					readErr = errors.Errorf("read %s: %w", hdr.Name, err)
-					break loop
-				}
-				// Propagate worker errors early.
-				if writeErr != nil {
-					readErr = writeErr
-					break loop
-				}
-				jobs <- writeJob{target: target, mode: hdr.FileInfo().Mode(), data: buf}
-			} else {
-				// Large file: write inline to keep memory bounded. Wait for the
-				// jobs channel to drain a little first so memory stays bounded
-				// while the large inline write is in progress.
-				f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hdr.FileInfo().Mode())
-				if err != nil {
-					readErr = errors.Errorf("open %s: %w", hdr.Name, err)
-					break loop
-				}
-				if _, err := io.CopyBuffer(f, io.LimitReader(tr, hdr.Size), copyBuf); err != nil {
-					f.Close() //nolint:errcheck,gosec
-					readErr = errors.Errorf("write %s: %w", hdr.Name, err)
-					break loop
-				}
-				if err := f.Close(); err != nil {
-					readErr = errors.Errorf("close %s: %w", hdr.Name, err)
-					break loop
-				}
-			}
-
-		case tar.TypeSymlink:
-			if skipExisting {
-				if _, err := os.Lstat(target); err == nil {
-					continue
-				}
-			}
-			if err := safeSymlinkTarget(name, hdr.Linkname); err != nil {
-				readErr = err
-				break loop
-			}
-			if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
-				readErr = errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
-				break loop
-			}
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				readErr = errors.Errorf("symlink %s → %s: %w", hdr.Name, hdr.Linkname, err)
-				break loop
-			}
-
-		case tar.TypeLink:
-			if skipExisting {
-				if _, err := os.Lstat(target); err == nil {
-					continue
-				}
-			}
-			linkName, err := safeTarEntryName(hdr.Linkname)
-			if err != nil {
-				readErr = errors.Errorf("unsafe hardlink target %q: %w", hdr.Linkname, err)
-				break loop
-			}
-			linkTarget := targetFn(linkName)
-			if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
-				readErr = errors.Errorf("mkdir for hardlink %s: %w", hdr.Name, err)
-				break loop
-			}
-			if err := os.Link(linkTarget, target); err != nil {
-				readErr = errors.Errorf("hardlink %s → %s: %w", hdr.Name, hdr.Linkname, err)
-				break loop
-			}
-		}
-	}
+	readErr := readTarEntries(r, targetFn, skipExisting, ensureDir, jobs, copyBuf, ctx)
 
 	close(jobs)
-	wg.Wait()
+	writeErr := g.Wait()
 
 	if readErr != nil {
 		return readErr
 	}
 	return writeErr
+}
+
+// readTarEntries iterates over a tar stream and dispatches file writes to the
+// jobs channel. Directories, symlinks, and hardlinks are handled inline.
+// Large files (>maxParallelFileSize) are written inline to bound memory.
+func readTarEntries(
+	r io.Reader,
+	targetFn func(string) string,
+	skipExisting bool,
+	ensureDir func(string, os.FileMode) error,
+	jobs chan<- writeJob,
+	copyBuf []byte,
+	ctx context.Context,
+) error {
+	tr := tar.NewReader(r)
+	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Wrap(err, "context cancelled")
+		}
+
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return errors.Wrap(err, "read tar entry")
+		}
+
+		if err := processEntry(tr, hdr, targetFn, skipExisting, ensureDir, jobs, copyBuf); err != nil {
+			return err
+		}
+	}
+}
+
+// processEntry handles a single tar header+body: directories, regular files,
+// symlinks, and hardlinks. It returns an error if the entry cannot be processed.
+func processEntry(
+	tr *tar.Reader,
+	hdr *tar.Header,
+	targetFn func(string) string,
+	skipExisting bool,
+	ensureDir func(string, os.FileMode) error,
+	jobs chan<- writeJob,
+	copyBuf []byte,
+) error {
+	name, err := safeTarEntryName(hdr.Name)
+	if err != nil {
+		return err
+	}
+
+	target := targetFn(name)
+
+	switch hdr.Typeflag {
+	case tar.TypeDir:
+		if err := ensureDir(target, hdr.FileInfo().Mode()); err != nil {
+			return errors.Errorf("mkdir %s: %w", hdr.Name, err)
+		}
+
+	case tar.TypeReg:
+		if skipExisting {
+			if _, err := os.Lstat(target); err == nil {
+				return nil
+			}
+		}
+		if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
+			return errors.Errorf("mkdir %s: %w", hdr.Name, err)
+		}
+
+		if hdr.Size <= maxParallelFileSize {
+			buf := make([]byte, hdr.Size)
+			if _, err := io.ReadFull(tr, buf); err != nil {
+				return errors.Errorf("read %s: %w", hdr.Name, err)
+			}
+			jobs <- writeJob{target: target, mode: hdr.FileInfo().Mode(), data: buf}
+		} else {
+			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hdr.FileInfo().Mode()) //nolint:gosec
+			if err != nil {
+				return errors.Errorf("open %s: %w", hdr.Name, err)
+			}
+			if _, err := io.CopyBuffer(f, io.LimitReader(tr, hdr.Size), copyBuf); err != nil {
+				f.Close() //nolint:errcheck,gosec
+				return errors.Errorf("write %s: %w", hdr.Name, err)
+			}
+			if err := f.Close(); err != nil {
+				return errors.Errorf("close %s: %w", hdr.Name, err)
+			}
+		}
+
+	case tar.TypeSymlink:
+		if skipExisting {
+			if _, err := os.Lstat(target); err == nil {
+				return nil
+			}
+		}
+		if err := safeSymlinkTarget(name, hdr.Linkname); err != nil {
+			return err
+		}
+		if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
+			return errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
+		}
+		if err := os.Symlink(hdr.Linkname, target); err != nil {
+			return errors.Errorf("symlink %s → %s: %w", hdr.Name, hdr.Linkname, err)
+		}
+
+	case tar.TypeLink:
+		if skipExisting {
+			if _, err := os.Lstat(target); err == nil {
+				return nil
+			}
+		}
+		linkName, err := safeTarEntryName(hdr.Linkname)
+		if err != nil {
+			return errors.Errorf("unsafe hardlink target %q: %w", hdr.Linkname, err)
+		}
+		linkTarget := targetFn(linkName)
+		if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
+			return errors.Errorf("mkdir for hardlink %s: %w", hdr.Name, err)
+		}
+		if err := os.Link(linkTarget, target); err != nil {
+			return errors.Errorf("hardlink %s → %s: %w", hdr.Name, hdr.Linkname, err)
+		}
+	}
+
+	return nil
 }
