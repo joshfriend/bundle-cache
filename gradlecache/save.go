@@ -385,8 +385,7 @@ func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error 
 	}
 
 	enc, err := zstd.NewWriter(w,
-		zstd.WithEncoderConcurrency(runtime.NumCPU()),
-		zstd.WithWindowSize(zstd.MaxWindowSize))
+		zstd.WithEncoderConcurrency(runtime.NumCPU()))
 	if err != nil {
 		return errors.Join(errors.Wrap(err, "create zstd encoder"), tarCmd.Wait())
 	}
@@ -413,8 +412,7 @@ func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error 
 // relPaths (relative to baseDir).
 func CreateDeltaTarZstd(_ context.Context, w io.Writer, baseDir string, relPaths []string) error {
 	enc, err := zstd.NewWriter(w,
-		zstd.WithEncoderConcurrency(runtime.NumCPU()),
-		zstd.WithWindowSize(zstd.MaxWindowSize))
+		zstd.WithEncoderConcurrency(runtime.NumCPU()))
 	if err != nil {
 		return errors.Wrap(err, "create zstd encoder")
 	}
