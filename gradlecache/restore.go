@@ -298,7 +298,8 @@ type extractRule struct {
 // extractBundleZstd decompresses and extracts a base bundle, routing tar
 // entries to their final destinations based on rules.
 func extractBundleZstd(_ context.Context, r io.Reader, rules []extractRule, defaultDir string, skipExisting bool) error {
-	dec, err := zstd.NewReader(bufio.NewReaderSize(r, 8<<20), zstd.WithDecoderConcurrency(runtime.NumCPU()))
+	br := bufio.NewReaderSize(r, 8<<20)
+	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.NumCPU()))
 	if err != nil {
 		return errors.Wrap(err, "create zstd decoder")
 	}
@@ -313,16 +314,34 @@ func extractBundleZstd(_ context.Context, r io.Reader, rules []extractRule, defa
 		return filepath.Join(defaultDir, name)
 	}
 
-	return extractTarPlatformRouted(dec, targetFn, skipExisting)
+	if err := extractTarPlatformRouted(dec, targetFn, skipExisting); err != nil {
+		return err
+	}
+	if err := drainCompressedReader(br); err != nil {
+		return errors.Wrap(err, "drain compressed reader")
+	}
+	return nil
 }
 
 func extractTarZstd(_ context.Context, r io.Reader, dir string) error {
-	dec, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(runtime.NumCPU()))
+	br := bufio.NewReaderSize(r, 8<<20)
+	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.NumCPU()))
 	if err != nil {
 		return errors.Wrap(err, "create zstd decoder")
 	}
 	defer dec.Close()
-	return extractTarPlatform(dec, dir)
+	if err := extractTarPlatform(dec, dir); err != nil {
+		return err
+	}
+	if err := drainCompressedReader(br); err != nil {
+		return errors.Wrap(err, "drain compressed reader")
+	}
+	return nil
+}
+
+func drainCompressedReader(r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
 }
 
 // countingBody wraps an io.Reader, counts bytes consumed, and records the time

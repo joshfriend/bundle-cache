@@ -344,6 +344,47 @@ func TestExtractBundleRouting(t *testing.T) {
 	}
 }
 
+func TestExtractZstdDrainsBufferedReaderToEOF(t *testing.T) {
+	ctx := context.Background()
+	srcDir := t.TempDir()
+	must(t, os.MkdirAll(filepath.Join(srcDir, "caches"), 0o755))
+	must(t, os.WriteFile(filepath.Join(srcDir, "caches", "entry.bin"), []byte("gradle data"), 0o644))
+
+	var archive bytes.Buffer
+	must(t, CreateDeltaTarZstd(ctx, &archive, srcDir, []string{"caches/entry.bin"}))
+
+	t.Run("bundle restore", func(t *testing.T) {
+		gradleHome := t.TempDir()
+		projectDir := t.TempDir()
+		cb := &countingBody{r: bytes.NewReader(archive.Bytes())}
+
+		err := extractBundleZstd(ctx, cb, []extractRule{
+			{prefix: "caches/", baseDir: gradleHome},
+		}, projectDir, false)
+		must(t, err)
+
+		if cb.eofAt.IsZero() {
+			t.Fatal("expected extractBundleZstd to drain the buffered reader to EOF")
+		}
+		if _, err := os.Stat(filepath.Join(gradleHome, "caches", "entry.bin")); err != nil {
+			t.Fatalf("expected extracted file: %v", err)
+		}
+	})
+
+	t.Run("delta restore", func(t *testing.T) {
+		dstDir := t.TempDir()
+		cb := &countingBody{r: bytes.NewReader(archive.Bytes())}
+
+		must(t, extractTarZstd(ctx, cb, dstDir))
+		if cb.eofAt.IsZero() {
+			t.Fatal("expected extractTarZstd to drain the buffered reader to EOF")
+		}
+		if _, err := os.Stat(filepath.Join(dstDir, "caches", "entry.bin")); err != nil {
+			t.Fatalf("expected extracted file: %v", err)
+		}
+	})
+}
+
 // ─── Git history walk tests ──────────────────────────────────────────────────
 
 // TestHistoryCommits creates a temporary git repository with a known commit
