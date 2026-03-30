@@ -126,4 +126,4 @@ S3 credentials are resolved via the standard AWS credential chain (environment v
 
 ## License
 
-MIT
+Apache 2.0
