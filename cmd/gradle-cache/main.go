@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"runtime/pprof"
 
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/kong"
@@ -29,6 +30,7 @@ type CLI struct {
 	StatsdAddr    string           `help:"DogStatsD address (host:port) for emitting metrics. Auto-detected from DD_AGENT_HOST if not set."`
 	DatadogAPIKey string           `help:"DataDog API key for direct metric submission (no agent required)." env:"DATADOG_API_KEY"`
 	MetricsTags   []string         `help:"Additional metric tags in key:value format. May be repeated." name:"metrics-tag"`
+	CPUProfile    string           `help:"Write CPU profile to file." name:"cpuprofile" hidden:""`
 }
 
 type backendFlags struct {
@@ -185,6 +187,21 @@ func main() {
 	)
 	setupLogger(cli.LogLevel)
 	slog.Debug("starting gradle-cache", "version", version)
+
+	if cli.CPUProfile != "" {
+		f, err := os.Create(cli.CPUProfile)
+		if err != nil {
+			kctx.Fatalf("could not create CPU profile: %v", err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			kctx.Fatalf("could not start CPU profile: %v", err)
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			f.Close()
+			slog.Info("CPU profile written", "path", cli.CPUProfile)
+		}()
+	}
 
 	mf := &gradlecache.MetricsFlags{
 		StatsdAddr:    cli.StatsdAddr,
