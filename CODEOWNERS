@@ -1,0 +1,5 @@
+# This CODEOWNERS file denotes the project leads
+# and encodes their responsibilities for code review.
+
+# These owners will be the default owners for everything in the repo.
+*       @joshfriend
