@@ -624,8 +624,10 @@ func WriteDeltaTar(w io.Writer, baseDir string, relPaths []string) error {
 	return tw.Close()
 }
 
-// ImmutableWorkspaceParents lists directory names whose immediate children are
-// immutable workspace directories (e.g. transforms/<hash>/, groovy-dsl/<hash>/).
+// ImmutableWorkspaceParents maps directory names to the depth at which their
+// immutable workspace hash directories live. Depth 1 means the hash dirs are
+// direct children (e.g. transforms/<hash>/). Depth 2 means the hash dirs are
+// one level deeper (e.g. kotlin-dsl/scripts/<hash>/).
 //
 // Each workspace is an atomic unit: Gradle creates all files together via an
 // atomic directory rename, and expects all files to be present when reading.
@@ -639,10 +641,18 @@ func WriteDeltaTar(w io.Writer, baseDir string, relPaths []string) error {
 //
 // The fix: when ANY file in a workspace is newer than the marker, include ALL
 // files from that workspace in the delta.
-var ImmutableWorkspaceParents = map[string]bool{
-	"transforms": true,
-	"groovy-dsl": true,
-	"kotlin-dsl": true,
+//
+// Workspace directory structure (relative to caches/<version>/):
+//   - transforms/<hash>/            depth 1 - artifact transforms
+//   - groovy-dsl/<hash>/            depth 1 - compiled Groovy build scripts
+//   - kotlin-dsl/scripts/<hash>/    depth 2 - compiled Kotlin build scripts
+//   - kotlin-dsl/accessors/<hash>/  depth 2 - generated type-safe accessors
+//   - dependencies-accessors/<hash>/ depth 1 - version catalog accessors
+var ImmutableWorkspaceParents = map[string]int{
+	"transforms":             1,
+	"groovy-dsl":             1,
+	"kotlin-dsl":             2,
+	"dependencies-accessors": 1,
 }
 
 // CollectNewFiles walks realCaches in parallel and returns paths of regular files
@@ -681,9 +691,12 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 	}
 
 	// walkWorkspaceParent handles directories like transforms/ whose children
-	// are atomic workspace directories. For each child, if any file is newer
-	// than since, all files are included.
-	walkWorkspaceParent := func(dir, rel string) {
+	// are atomic workspace directories. depth indicates how many directory levels
+	// below dir the actual hash workspace directories live. When depth > 1
+	// (e.g. kotlin-dsl/scripts/<hash>/), it recurses into intermediate directories
+	// before treating children as atomic workspaces.
+	var walkWorkspaceParent func(dir, rel string, depth int)
+	walkWorkspaceParent = func(dir, rel string, depth int) {
 		defer wg.Done()
 
 		entries, err := os.ReadDir(dir)
@@ -704,6 +717,14 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 			}
 			childDir := filepath.Join(dir, entry.Name())
 			childRel := rel + "/" + entry.Name()
+
+			if depth > 1 {
+				// Not yet at the hash workspace level — recurse one level deeper.
+				sem <- struct{}{}
+				wg.Add(1)
+				go walkWorkspaceParent(childDir, childRel, depth-1)
+				continue
+			}
 
 			hasNew := false
 			_ = filepath.WalkDir(childDir, func(_ string, d os.DirEntry, err error) error {
@@ -755,10 +776,10 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 				if IsExcludedCache(name) || IsDeltaExcluded(name) {
 					continue
 				}
-				if ImmutableWorkspaceParents[name] {
+				if depth, ok := ImmutableWorkspaceParents[name]; ok {
 					sem <- struct{}{}
 					wg.Add(1)
-					go walkWorkspaceParent(filepath.Join(dir, name), childRel)
+					go walkWorkspaceParent(filepath.Join(dir, name), childRel, depth)
 				} else {
 					sem <- struct{}{}
 					wg.Add(1)
