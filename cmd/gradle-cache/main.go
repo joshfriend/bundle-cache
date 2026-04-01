@@ -30,7 +30,7 @@ type CLI struct {
 	StatsdAddr    string           `help:"DogStatsD address (host:port) for emitting metrics. Auto-detected from DD_AGENT_HOST if not set."`
 	DatadogAPIKey string           `help:"DataDog API key for direct metric submission (no agent required)." env:"DATADOG_API_KEY"`
 	MetricsTags   []string         `help:"Additional metric tags in key:value format. May be repeated." name:"metrics-tag"`
-	CPUProfile    string           `help:"Write CPU profile to file." name:"cpuprofile" hidden:""`
+	CPUProfile    string           `help:"Write CPU profile to file." name:"cpuprofile" hidden:"" type:"path"`
 }
 
 type backendFlags struct {
@@ -69,8 +69,8 @@ type RestoreCmd struct {
 	Ref            string   `help:"Git ref used to search for a base bundle. When --branch is set, history walks from the merge-base of HEAD and this ref." default:"HEAD"`
 	Commit         string   `help:"Specific commit SHA to try directly, skipping history walk."`
 	MaxBlocks      int      `help:"Number of distinct-author commit blocks to search." default:"20"`
-	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
-	IncludedBuilds []string `help:"Included build directories whose build/ output to restore. May be repeated." name:"included-build"`
+	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to restore. May be repeated." name:"included-build" type:"path"`
 	Branch         string   `help:"Branch name to also apply a delta bundle for." optional:""`
 }
 
@@ -100,9 +100,9 @@ type RestoreDeltaCmd struct {
 	backendFlags
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
 	Branch         string   `help:"Branch name to look up a delta for." required:""`
-	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
+	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	ProjectDir     string   `help:"Project directory for routing project-specific cache entries." type:"path"`
-	IncludedBuilds []string `help:"Included build directories whose build/ output to route. May be repeated." name:"included-build"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to route. May be repeated." name:"included-build" type:"path"`
 }
 
 func (c *RestoreDeltaCmd) AfterApply() error { return c.validate() }
@@ -129,8 +129,8 @@ type SaveCmd struct {
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
 	Commit         string   `help:"Commit SHA to tag this bundle with. Defaults to HEAD of --git-dir."`
 	GitDir         string   `help:"Path to the git repository." default:"." type:"path"`
-	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
-	IncludedBuilds []string `help:"Included build directories whose build/ output to archive. May be repeated." name:"included-build"`
+	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to archive. May be repeated." name:"included-build" type:"path"`
 }
 
 func (c *SaveCmd) AfterApply() error { return c.validate() }
@@ -156,9 +156,9 @@ type SaveDeltaCmd struct {
 	backendFlags
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
 	Branch         string   `help:"Branch name to save the delta under." required:""`
-	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
+	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	ProjectDir     string   `help:"Project directory to scan for project-specific cache changes." type:"path"`
-	IncludedBuilds []string `help:"Included build directories whose build/ output to include in delta. May be repeated." name:"included-build"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to include in delta. May be repeated." name:"included-build" type:"path"`
 }
 
 func (c *SaveDeltaCmd) AfterApply() error { return c.validate() }
