@@ -110,7 +110,12 @@ function gitDirArgs() {
  */
 function execOptions(extra) {
   const projectDir = core.getInput("project-dir") || ".";
-  return { cwd: path.resolve(projectDir), ...extra };
+  const ghToken = core.getInput("github-token") || process.env.GITHUB_TOKEN;
+  const env = { ...process.env };
+  if (ghToken) {
+    env.GITHUB_TOKEN = ghToken;
+  }
+  return { cwd: path.resolve(projectDir), env, ...extra };
 }
 
 /**

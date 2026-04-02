@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -36,6 +37,8 @@ type ghaCacheStore struct {
 	token   string // ACTIONS_RUNTIME_TOKEN
 	http    *http.Client
 }
+
+var errCacheAlreadyExists = errors.New("cache entry already exists")
 
 const (
 	// ghaBlockSize is the size of each Azure Block Blob block.
@@ -113,10 +116,52 @@ func (g *ghaCacheStore) twirpCall(ctx context.Context, method string, reqBody, r
 
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if resp.StatusCode == http.StatusConflict {
+			return errors.Wrap(errCacheAlreadyExists, string(msg))
+		}
 		return errors.Errorf("%s: status %d: %s", method, resp.StatusCode, msg)
 	}
 
 	return json.NewDecoder(resp.Body).Decode(respBody)
+}
+
+// deleteByKey deletes a cache entry via the GitHub Actions REST API.
+// This is needed because the Twirp v2 API doesn't expose a delete RPC, but
+// the REST API at /repos/{owner}/{repo}/actions/caches?key=... does.
+func (g *ghaCacheStore) deleteByKey(ctx context.Context, key string) error {
+	repo := os.Getenv("GITHUB_REPOSITORY")
+	apiURL := os.Getenv("GITHUB_API_URL")
+	if apiURL == "" {
+		apiURL = "https://api.github.com"
+	}
+
+	u := fmt.Sprintf("%s/repos/%s/actions/caches?key=%s", apiURL, repo, url.QueryEscape(key))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return errors.Wrap(err, "build delete request")
+	}
+	// The REST API requires GITHUB_TOKEN, not the ACTIONS_RUNTIME_TOKEN used
+	// by the Twirp cache API.
+	ghToken := os.Getenv("GITHUB_TOKEN")
+	if ghToken == "" {
+		return errors.New("GITHUB_TOKEN is required to delete cache entries")
+	}
+	req.Header.Set("Authorization", "Bearer "+ghToken)
+
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return errors.Wrap(err, "delete cache entry")
+	}
+	defer func() {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
+		resp.Body.Close()              //nolint:errcheck,gosec
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return errors.Errorf("delete cache entry: status %d: %s", resp.StatusCode, body)
+	}
+	return nil
 }
 
 // ─── Twirp request/response types ───────────────────────────────────────────
@@ -235,13 +280,23 @@ func (g *ghaCacheStore) createAndFinalize(ctx context.Context, commit, cacheKey 
 	key := ghaCacheKey(commit, cacheKey)
 	version := ghaCacheVersion(cacheKey)
 
-	// 1. Create cache entry → get signed upload URL
+	// 1. Create cache entry → get signed upload URL.
+	// If the entry already exists (409), delete it and retry once.
 	var createResp ghaCreateEntryResp
-	if err := g.twirpCall(ctx, "CreateCacheEntry", ghaCreateEntryReq{
+	createReq := ghaCreateEntryReq{
 		Metadata: g.metadata(),
 		Key:      key,
 		Version:  version,
-	}, &createResp); err != nil {
+	}
+	if err := g.twirpCall(ctx, "CreateCacheEntry", createReq, &createResp); errors.Is(err, errCacheAlreadyExists) {
+		slog.Info("cache entry already exists, deleting and retrying", "key", key)
+		if delErr := g.deleteByKey(ctx, key); delErr != nil {
+			return errors.Wrap(delErr, "delete existing cache entry")
+		}
+		if err := g.twirpCall(ctx, "CreateCacheEntry", createReq, &createResp); err != nil {
+			return errors.Wrap(err, "gha cache create (after delete)")
+		}
+	} else if err != nil {
 		return errors.Wrap(err, "gha cache create")
 	}
 	if !createResp.OK || createResp.SignedUploadURL == "" {
@@ -293,11 +348,20 @@ func (g *ghaCacheStore) putStream(ctx context.Context, commit, cacheKey string, 
 	version := ghaCacheVersion(cacheKey)
 
 	var createResp ghaCreateEntryResp
-	if err := g.twirpCall(ctx, "CreateCacheEntry", ghaCreateEntryReq{
+	createReq := ghaCreateEntryReq{
 		Metadata: g.metadata(),
 		Key:      key,
 		Version:  version,
-	}, &createResp); err != nil {
+	}
+	if err := g.twirpCall(ctx, "CreateCacheEntry", createReq, &createResp); errors.Is(err, errCacheAlreadyExists) {
+		slog.Info("cache entry already exists, deleting and retrying", "key", key)
+		if delErr := g.deleteByKey(ctx, key); delErr != nil {
+			return 0, errors.Wrap(delErr, "delete existing cache entry")
+		}
+		if err := g.twirpCall(ctx, "CreateCacheEntry", createReq, &createResp); err != nil {
+			return 0, errors.Wrap(err, "gha cache create (after delete)")
+		}
+	} else if err != nil {
 		return 0, errors.Wrap(err, "gha cache create")
 	}
 	if !createResp.OK || createResp.SignedUploadURL == "" {

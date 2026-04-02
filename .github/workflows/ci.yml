@@ -15,16 +15,24 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ hashFiles('go.sum') }}
+          restore-keys: go-
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
 
-      - name: Test
-        run: go test -run ^Test -timeout 300s ./...
+      - name: Unit tests
+        run: go test -v -short -timeout 300s ./...
 
-      - name: Build
-        run: go build ./...
+      - name: Integration tests
+        run: go test -v -run ^TestIntegration -timeout 600s ./cmd/gradle-cache/
 
   lint:
     runs-on: ubuntu-latest
@@ -33,6 +41,14 @@ jobs:
 
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ hashFiles('go.sum') }}
+          restore-keys: go-
 
       - name: Lint
         run: golangci-lint run
@@ -49,6 +65,14 @@ jobs:
 
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ hashFiles('go.sum') }}
+          restore-keys: go-
 
       - uses: actions/setup-java@v4
         with:
@@ -87,6 +111,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -94,6 +120,14 @@ jobs:
 
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ hashFiles('go.sum') }}
+          restore-keys: go-
 
       - uses: actions/setup-java@v4
         with:
@@ -150,6 +184,14 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ hashFiles('go.sum') }}
+          restore-keys: go-
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -195,6 +237,14 @@ jobs:
 
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ hashFiles('go.sum') }}
+          restore-keys: go-
 
       - name: Release
         run: goreleaser release --clean

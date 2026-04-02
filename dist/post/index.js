@@ -33634,7 +33634,12 @@ function gitDirArgs() {
  */
 function execOptions(extra) {
   const projectDir = core.getInput("project-dir") || ".";
-  return { cwd: path.resolve(projectDir), ...extra };
+  const ghToken = core.getInput("github-token") || process.env.GITHUB_TOKEN;
+  const env = { ...process.env };
+  if (ghToken) {
+    env.GITHUB_TOKEN = ghToken;
+  }
+  return { cwd: path.resolve(projectDir), env, ...extra };
 }
 
 /**
@@ -33990,6 +33995,8 @@ module.exports = require("util");
 /******/ 	
 /************************************************************************/
 var __webpack_exports__ = {};
+const fs = __nccwpck_require__(9896);
+const path = __nccwpck_require__(6928);
 const core = __nccwpck_require__(7484);
 const exec = __nccwpck_require__(5236);
 const {
@@ -34012,13 +34019,20 @@ async function run() {
     const branch = resolveBranch();
 
     if (branch) {
-      // save-delta will fall back to full save if no restore marker exists
+      // On cold-start (no base cache found), there's no restore marker so
+      // save-delta would fail. Detect this and skip gracefully.
+      const gradleHome = core.getInput("gradle-user-home") || "~/.gradle";
+      const marker = path.resolve(gradleHome, ".cache-restore-marker");
+      if (!fs.existsSync(marker)) {
+        core.info("No restore marker found (cold-start) — skipping delta save");
+        return;
+      }
+
       const args = [
         "save-delta",
         ...commonArgs(),
         ...backendArgs(),
         ...gradleHomeArgs(),
-        ...gitDirArgs(),
         "--branch",
         branch,
       ];
@@ -34035,7 +34049,7 @@ async function run() {
       await exec.exec("gradle-cache", args, execOptions());
     }
   } catch (error) {
-    core.warning(`Cache save failed: ${error.message}`);
+    core.setFailed(`Cache save failed: ${error.message}`);
   }
 }
 

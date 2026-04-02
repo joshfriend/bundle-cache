@@ -64,6 +64,12 @@ inputs:
     description: "Log level: debug, info, warn, or error."
     required: false
     default: info
+  github-token:
+    description: >
+      GitHub token used for cache management (e.g. deleting stale delta
+      entries). Defaults to the automatic GITHUB_TOKEN.
+    required: false
+    default: ${{ github.token }}
 
 runs:
   using: node24
