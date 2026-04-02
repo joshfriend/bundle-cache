@@ -200,7 +200,7 @@ func Save(ctx context.Context, cfg SaveConfig) error {
 	if !cfg.SkipWarm {
 		log.Debug("warming page cache")
 		warmStart := time.Now()
-		warmPageCache(sources)
+		warmPageCache(ctx, sources)
 		log.Debug("page cache warm", "duration", time.Since(warmStart).Round(time.Millisecond))
 	} else {
 		log.Debug("skipping page cache warm (SkipWarm=true)")
@@ -521,13 +521,14 @@ func matchesAny(name string, patterns []string) bool {
 	return false
 }
 
-// warmPageCache reads every regular file under each TarSource in parallel,
-// faulting pages into the OS page cache before tar reads them sequentially.
-// On cold NVMe storage with many small files (e.g. 200K Gradle cache entries),
-// tar is limited to ~80 MB/s by per-file IOPS overhead. Warming the cache with
-// parallel readers saturates IOPS up front so that tar subsequently reads at
-// memory speed (~1300 MB/s).
-func warmPageCache(sources []TarSource) {
+// warmPageCache issues POSIX_FADV_WILLNEED on every regular file under each
+// TarSource in parallel, hinting the kernel to start async readahead before
+// tar reads them sequentially. On cold NVMe storage with many small files
+// (e.g. 200K Gradle cache entries), tar is limited to ~80 MB/s by per-file
+// IOPS overhead. Warming the cache saturates IOPS up front so that tar
+// subsequently reads at memory speed (~1300 MB/s). On non-Linux platforms,
+// falls back to reading files into the page cache directly.
+func warmPageCache(ctx context.Context, sources []TarSource) {
 	concurrency := min(runtime.GOMAXPROCS(0)*2, 32)
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
@@ -535,19 +536,26 @@ func warmPageCache(sources []TarSource) {
 	for _, src := range sources {
 		root := filepath.Join(src.BaseDir, src.Path)
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || !d.Type().IsRegular() {
+			if ctx.Err() != nil {
+				return filepath.SkipAll
+			}
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if IsExcludedCache(d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !d.Type().IsRegular() || IsExcludedCache(d.Name()) {
 				return nil
 			}
 			sem <- struct{}{}
 			wg.Add(1)
 			go func() {
 				defer func() { <-sem; wg.Done() }()
-				f, err := os.Open(path)
-				if err != nil {
-					return
-				}
-				_, _ = io.Copy(io.Discard, f)
-				_ = f.Close()
+				adviseWillNeed(path)
 			}()
 			return nil
 		})
