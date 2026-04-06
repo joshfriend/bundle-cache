@@ -349,6 +349,9 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 	log.Info("cache hit", "commit", hitCommit, "cache-key", cfg.CacheKey)
 
 	// ── Delta pre-fetch (concurrent with base extraction) ────────────────
+	// Download the delta bundle to a temp file while the base extracts.
+	// Extraction happens sequentially after the base + marker, so delta
+	// files get mtime > marker and are recaptured into the next delta save.
 	type deltaResult struct {
 		tmpFile *os.File
 		dlStart time.Time
@@ -367,7 +370,7 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 				deltaCh <- deltaResult{}
 				return
 			}
-			log.Info("found delta bundle, downloading in background", "branch", cfg.Branch)
+			log.Info("downloading delta bundle", "branch", cfg.Branch)
 			dlStart := time.Now()
 			body, err := store.get(ctx, dc, cfg.CacheKey, deltaInfo)
 			if err != nil {
@@ -459,19 +462,21 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 		attrs = append(attrs, "disk_mbps", fmt.Sprintf("%.1f", float64(ps.uncompressedBytes)/diskBusy.Seconds()/1e6))
 	}
 	log.Info("restore pipeline complete", attrs...)
-	cfg.Metrics.Distribution("gradle_cache.restore.duration_ms", float64(totalElapsed.Milliseconds()), "cache_key:"+cfg.CacheKey)
-	cfg.Metrics.Distribution("gradle_cache.restore.size_bytes", float64(cb.n), "cache_key:"+cfg.CacheKey)
+	cfg.Metrics.Distribution("gradle_cache.restore_base.duration_ms", float64(totalElapsed.Milliseconds()), "cache_key:"+cfg.CacheKey)
+	cfg.Metrics.Distribution("gradle_cache.restore_base.size_bytes", float64(cb.n), "cache_key:"+cfg.CacheKey)
 	if !cb.eofAt.IsZero() {
 		dlElapsed := cb.eofAt.Sub(dlStart)
 		mbps := float64(cb.n) / dlElapsed.Seconds() / 1e6
-		cfg.Metrics.Distribution("gradle_cache.restore.speed_mbps", mbps, "cache_key:"+cfg.CacheKey)
+		cfg.Metrics.Distribution("gradle_cache.restore_base.speed_mbps", mbps, "cache_key:"+cfg.CacheKey)
 	}
 
 	if err := touchMarkerFile(filepath.Join(cfg.GradleUserHome, ".cache-restore-marker")); err != nil {
 		log.Warn("could not write restore marker", "err", err)
 	}
 
-	// ── Apply delta bundle (if Branch was given) ─────────────────────────
+	// ── Apply delta bundle (sequentially, after base + marker) ──────────
+	// Extracted after the marker so delta files get mtime > marker and are
+	// recaptured into the next delta save, enabling accumulation across builds.
 	if deltaCh != nil {
 		dr := <-deltaCh
 		if dr.err != nil {
@@ -493,12 +498,25 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 			if err := extractDeltaTarZstdRouted(dr.tmpFile, rules, projectDir); err != nil {
 				return errors.Wrap(err, "extract delta bundle")
 			}
+			applyElapsed := time.Since(applyStart)
 			log.Info("applied delta bundle", "branch", cfg.Branch,
-				"duration", time.Since(applyStart).Round(time.Millisecond))
+				"duration", applyElapsed.Round(time.Millisecond))
+			cfg.Metrics.Distribution("gradle_cache.restore_delta.apply_duration_ms", float64(applyElapsed.Milliseconds()),
+				"cache_key:"+cfg.CacheKey)
+			cfg.Metrics.Distribution("gradle_cache.restore_delta.size_bytes", float64(dr.n),
+				"cache_key:"+cfg.CacheKey)
+			if !dr.eofAt.IsZero() {
+				dlElapsed := dr.eofAt.Sub(dr.dlStart)
+				cfg.Metrics.Distribution("gradle_cache.restore_delta.download_duration_ms", float64(dlElapsed.Milliseconds()),
+					"cache_key:"+cfg.CacheKey)
+			}
 		}
 	}
 
-	log.Debug("restore complete")
+	restoreTotal := time.Since(findStart)
+	log.Info("restore complete", "total_duration", restoreTotal.Round(time.Millisecond))
+	cfg.Metrics.Distribution("gradle_cache.restore.duration_ms", float64(restoreTotal.Milliseconds()),
+		"cache_key:"+cfg.CacheKey)
 	return nil
 }
 
