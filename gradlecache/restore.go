@@ -204,6 +204,8 @@ type RestoreConfig struct {
 	Region string
 	// CachewURL is the cachew server URL. Mutually exclusive with Bucket.
 	CachewURL string
+	// KeyPrefix is an optional path prefix prepended to all S3 object keys.
+	KeyPrefix string
 	// CacheKey is the bundle identifier (e.g. "my-project:assembleRelease").
 	CacheKey string
 	// GitDir is the path to the git repository for history walking. Defaults to ".".
@@ -296,7 +298,7 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 	}
 	log := cfg.Logger
 
-	store, err := newStore(cfg.Bucket, cfg.Region, cfg.CachewURL)
+	store, err := newStore(cfg.Bucket, cfg.Region, cfg.CachewURL, cfg.KeyPrefix)
 	if err != nil {
 		return err
 	}

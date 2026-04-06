@@ -204,7 +204,7 @@ func TestS3Key(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		if got := s3Key(tt.commit, tt.cacheKey, tt.bundleFile); got != tt.want {
+		if got := s3Key("", tt.commit, tt.cacheKey, tt.bundleFile); got != tt.want {
 			t.Errorf("s3Key(%q, %q, %q) = %q, want %q",
 				tt.commit, tt.cacheKey, tt.bundleFile, got, tt.want)
 		}
@@ -1460,7 +1460,7 @@ func TestS3BundleStoreRoundTrip(t *testing.T) {
 	cacheKey := "apos-beta"
 	payload := []byte("bundle contents")
 
-	legacyKey := "test-bucket/" + s3Key(commit, cacheKey, bundleFilename(cacheKey))
+	legacyKey := "test-bucket/" + s3Key("", commit, cacheKey, bundleFilename(cacheKey))
 	fs.mu.Lock()
 	fs.objects[legacyKey] = payload
 	fs.mu.Unlock()

@@ -36,6 +36,7 @@ type CLI struct {
 type backendFlags struct {
 	Bucket        string `help:"S3 bucket name."`
 	Region        string `help:"AWS region." default:"us-west-2" env:"AWS_REGION"`
+	KeyPrefix     string `help:"Optional path prefix prepended to all S3 object keys." name:"key-prefix"`
 	CachewURL     string `help:"Cachew server URL (e.g. http://localhost:8080). Mutually exclusive with --bucket." name:"cachew-url"`
 	GithubActions bool   `help:"Use the GitHub Actions Cache backend." name:"github-actions"`
 }
@@ -82,6 +83,7 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient)
 		Bucket:         c.Bucket,
 		Region:         c.Region,
 		CachewURL:      c.CachewURL,
+		KeyPrefix:      c.KeyPrefix,
 		CacheKey:       c.CacheKey,
 		GitDir:         c.GitDir,
 		Ref:            c.Ref,
@@ -113,6 +115,7 @@ func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsCl
 		Bucket:         c.Bucket,
 		Region:         c.Region,
 		CachewURL:      c.CachewURL,
+		KeyPrefix:      c.KeyPrefix,
 		CacheKey:       c.CacheKey,
 		Branch:         c.Branch,
 		GradleUserHome: c.GradleUserHome,
@@ -141,6 +144,7 @@ func (c *SaveCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) er
 		Bucket:         c.Bucket,
 		Region:         c.Region,
 		CachewURL:      c.CachewURL,
+		KeyPrefix:      c.KeyPrefix,
 		CacheKey:       c.CacheKey,
 		Commit:         c.Commit,
 		GitDir:         c.GitDir,
@@ -169,6 +173,7 @@ func (c *SaveDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsClien
 		Bucket:         c.Bucket,
 		Region:         c.Region,
 		CachewURL:      c.CachewURL,
+		KeyPrefix:      c.KeyPrefix,
 		CacheKey:       c.CacheKey,
 		Branch:         c.Branch,
 		GradleUserHome: c.GradleUserHome,

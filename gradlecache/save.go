@@ -27,6 +27,7 @@ type RestoreDeltaConfig struct {
 	Bucket         string
 	Region         string
 	CachewURL      string
+	KeyPrefix      string
 	CacheKey       string
 	Branch         string
 	GradleUserHome string
@@ -63,7 +64,7 @@ func RestoreDelta(ctx context.Context, cfg RestoreDeltaConfig) error {
 		return errors.Errorf("caches directory not found at %s — run restore first: %w", cachesDir, err)
 	}
 
-	store, err := newStore(cfg.Bucket, cfg.Region, cfg.CachewURL)
+	store, err := newStore(cfg.Bucket, cfg.Region, cfg.CachewURL, cfg.KeyPrefix)
 	if err != nil {
 		return err
 	}
@@ -120,6 +121,7 @@ type SaveConfig struct {
 	Bucket         string
 	Region         string
 	CachewURL      string
+	KeyPrefix      string
 	CacheKey       string
 	Commit         string
 	GitDir         string
@@ -173,7 +175,7 @@ func Save(ctx context.Context, cfg SaveConfig) error {
 		return errors.Errorf("caches directory not found at %s: %w", cachesDir, err)
 	}
 
-	store, err := newStore(cfg.Bucket, cfg.Region, cfg.CachewURL)
+	store, err := newStore(cfg.Bucket, cfg.Region, cfg.CachewURL, cfg.KeyPrefix)
 	if err != nil {
 		return err
 	}
@@ -267,6 +269,7 @@ type SaveDeltaConfig struct {
 	Bucket         string
 	Region         string
 	CachewURL      string
+	KeyPrefix      string
 	CacheKey       string
 	Branch         string
 	GradleUserHome string
@@ -345,7 +348,7 @@ func SaveDelta(ctx context.Context, cfg SaveDeltaConfig) error {
 		return nil
 	}
 
-	store, err := newStore(cfg.Bucket, cfg.Region, cfg.CachewURL)
+	store, err := newStore(cfg.Bucket, cfg.Region, cfg.CachewURL, cfg.KeyPrefix)
 	if err != nil {
 		return err
 	}

@@ -65,6 +65,8 @@ function backendArgs() {
   if (bucket) {
     args.push("--bucket", bucket);
     if (region) args.push("--region", region);
+    const keyPrefix = core.getInput("key-prefix");
+    if (keyPrefix) args.push("--key-prefix", keyPrefix);
   } else {
     // Default to GitHub Actions cache when no explicit backend is configured.
     args.push("--github-actions");

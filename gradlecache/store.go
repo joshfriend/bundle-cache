@@ -33,7 +33,7 @@ type bundleStore interface {
 	putStream(ctx context.Context, commit, cacheKey string, r io.Reader) (int64, error)
 }
 
-func newStore(bucket, region, cachewURL string) (bundleStore, error) {
+func newStore(bucket, region, cachewURL, keyPrefix string) (bundleStore, error) {
 	if cachewURL != "" {
 		return newCachewClient(cachewURL), nil
 	}
@@ -46,18 +46,19 @@ func newStore(bucket, region, cachewURL string) (bundleStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &s3BundleStore{client: client, bucket: bucket}, nil
+	return &s3BundleStore{client: client, bucket: bucket, keyPrefix: keyPrefix}, nil
 }
 
 // ── S3 bundle store ─────────────────────────────────────────────────────────
 
 type s3BundleStore struct {
-	client *s3Client
-	bucket string
+	client    *s3Client
+	bucket    string
+	keyPrefix string // optional path prefix prepended to all object keys
 }
 
 func (s *s3BundleStore) stat(ctx context.Context, commit, cacheKey string) (bundleStatInfo, error) {
-	obj, err := s.client.stat(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)))
+	obj, err := s.client.stat(ctx, s.bucket, s3Key(s.keyPrefix, commit, cacheKey, bundleFilename(cacheKey)))
 	if err != nil {
 		return bundleStatInfo{}, err
 	}
@@ -65,23 +66,27 @@ func (s *s3BundleStore) stat(ctx context.Context, commit, cacheKey string) (bund
 }
 
 func (s *s3BundleStore) get(ctx context.Context, commit, cacheKey string, info bundleStatInfo) (io.ReadCloser, error) {
-	return s.client.get(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)), s3ObjInfo{Size: info.Size, ETag: info.etag})
+	return s.client.get(ctx, s.bucket, s3Key(s.keyPrefix, commit, cacheKey, bundleFilename(cacheKey)), s3ObjInfo{Size: info.Size, ETag: info.etag})
 }
 
 func (s *s3BundleStore) put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64) error {
-	return s.client.put(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)), r, size, "application/zstd")
+	return s.client.put(ctx, s.bucket, s3Key(s.keyPrefix, commit, cacheKey, bundleFilename(cacheKey)), r, size, "application/zstd")
 }
 
 func (s *s3BundleStore) putStream(ctx context.Context, commit, cacheKey string, r io.Reader) (int64, error) {
-	return s.client.putStreamingMultipart(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)), r, "application/zstd")
+	return s.client.putStreamingMultipart(ctx, s.bucket, s3Key(s.keyPrefix, commit, cacheKey, bundleFilename(cacheKey)), r, "application/zstd")
 }
 
 func bundleFilename(cacheKey string) string {
 	return strings.ReplaceAll(cacheKey, ":", "-") + ".tar.zst"
 }
 
-func s3Key(commit, cacheKey, bundleFile string) string {
-	return commit + "/" + cacheKey + "/" + bundleFile
+func s3Key(prefix, commit, cacheKey, bundleFile string) string {
+	key := commit + "/" + cacheKey + "/" + bundleFile
+	if prefix != "" {
+		return prefix + "/" + key
+	}
+	return key
 }
 
 // ── Cachew client ───────────────────────────────────────────────────────────

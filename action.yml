@@ -23,6 +23,11 @@ inputs:
     description: AWS region for the S3 bucket.
     required: false
     default: us-west-2
+  key-prefix:
+    description: >
+      Optional path prefix prepended to all S3 object keys. Useful for
+      namespacing objects within a shared bucket.
+    required: false
   ref:
     description: >
       Git ref used to search for a base bundle. On pull_request restores, the
