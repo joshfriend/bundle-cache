@@ -490,7 +490,7 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 					"speed_mbps", fmt.Sprintf("%.1f", float64(dr.n)/dlElapsed.Seconds()/1e6))
 			}
 			applyStart := time.Now()
-			if err := extractTarZstd(ctx, dr.tmpFile, cfg.GradleUserHome); err != nil {
+			if err := extractDeltaTarZstdRouted(dr.tmpFile, rules, projectDir); err != nil {
 				return errors.Wrap(err, "extract delta bundle")
 			}
 			log.Info("applied delta bundle", "branch", cfg.Branch,
@@ -778,6 +778,32 @@ func extractBundleZstdMultiFrame(ctx context.Context, br *bufio.Reader, dlTiming
 		compressedBytes:   dlTiming.bytes,
 		uncompressedBytes: decTiming.bytes,
 	}, nil
+}
+
+// extractDeltaTarZstdRouted decompresses a delta bundle and extracts it using
+// the same routing rules as the base bundle, ensuring delta files land in the
+// correct directories (e.g. configuration-cache/ goes to projectDir/.gradle/).
+func extractDeltaTarZstdRouted(r io.Reader, rules []extractRule, defaultDir string) error {
+	br := bufio.NewReaderSize(r, 8<<20)
+	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)))
+	if err != nil {
+		return errors.Wrap(err, "create zstd decoder")
+	}
+	defer dec.Close()
+
+	targetFn := func(name string) string {
+		for _, rule := range rules {
+			if strings.HasPrefix(name, rule.prefix) {
+				return filepath.Join(rule.baseDir, name)
+			}
+		}
+		return filepath.Join(defaultDir, name)
+	}
+
+	if err := extractTarPlatformRouted(dec, targetFn, false); err != nil {
+		return err
+	}
+	return drainCompressedReader(br)
 }
 
 func extractTarZstd(_ context.Context, r io.Reader, dir string) error {
